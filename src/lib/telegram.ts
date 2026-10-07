@@ -120,9 +120,36 @@ export function initConfirmationHandlers() {
       .returning({ id: jobRuns.id, jobType: jobRuns.jobType });
 
     if (!updatedJob) {
+      const [currentJob] = await db
+        .select({ status: jobRuns.status })
+        .from(jobRuns)
+        .where(eq(jobRuns.id, jobRunId))
+        .limit(1);
+
+      if (action === "approve" && (currentJob?.status === "confirmed" || currentJob?.status === "sent")) {
+        await bot.api.sendMessage({
+          chat_id: chatId,
+          text: `Job #${jobRunId} has already been approved${currentJob.status === "sent" ? " and its email was accepted by SMTP" : " and is processing the email"}. Refresh the dashboard for the latest status.`,
+        });
+        return;
+      }
+
+      if (action === "reject" && currentJob?.status === "rejected") {
+        await bot.api.sendMessage({
+          chat_id: chatId,
+          text: `Job #${jobRunId} was already cancelled.`,
+        });
+        return;
+      }
+
+      console.warn(
+        `[Telegram] Could not apply ${action} to job #${jobRunId}; current status: ${currentJob?.status ?? "not found"}`
+      );
       await bot.api.sendMessage({
         chat_id: chatId,
-        text: `Job #${jobRunId} is no longer awaiting confirmation. Please refresh the dashboard.`,
+        text: currentJob
+          ? `Job #${jobRunId} is currently "${currentJob.status}", so this confirmation button cannot be applied. Refresh the dashboard.`
+          : `Job #${jobRunId} was not found. Refresh the dashboard and check that the app is connected to the expected database.`,
       });
       return;
     }

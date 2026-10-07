@@ -56,7 +56,12 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
       .then(() => "queue" as const);
     const pageState = await Promise.race([loginRedirect, queueReady]);
     if (pageState === "login") {
-      throw new Error("Queue page redirected to login; verify portal credentials");
+      const loginPath = new URL(page.url()).pathname;
+      throw new Error(
+        `QAdmin returned a login page instead of the queue page (${loginPath}). ` +
+          "The session is not authenticated. Verify QADMIN_USERNAME and QADMIN_PASSWORD " +
+          "in the production app's environment, and confirm this account can open QADMIN_QUEUE_URL."
+      );
     }
 
     const queueStatus = await queueSection.locator("tbody tr").evaluateAll((rows) =>
