@@ -4,8 +4,10 @@ export interface JobRetryBudget {
   retriesRemaining: number;
 }
 
-export function createJobRetryBudget(): JobRetryBudget {
-  return { retriesRemaining: MAX_JOB_RETRIES };
+export function createJobRetryBudget(retriesAlreadyUsed = 0): JobRetryBudget {
+  return {
+    retriesRemaining: Math.max(0, MAX_JOB_RETRIES - retriesAlreadyUsed),
+  };
 }
 
 export async function retryImmediatelyUntilSuccessful<T>(

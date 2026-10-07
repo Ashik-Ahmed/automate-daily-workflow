@@ -14,6 +14,7 @@ import {
   escapeTelegramHtml,
   markJobRunnerActive,
   markJobRunnerInactive,
+  registerJobResumer,
   sendConfirmationRequest,
   sendNotification,
 } from "@/lib/telegram";
@@ -267,6 +268,7 @@ export async function runConnectivityJob(
           );
         }
       }
+
     );
     emailAccepted = true;
 
@@ -320,3 +322,120 @@ export async function runConnectivityJob(
     markJobRunnerInactive(jobId);
   }
 }
+
+export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<void> {
+  markJobRunnerActive(jobRunId);
+  let emailAccepted = false;
+  try {
+    const [job] = await db
+      .select()
+      .from(jobRuns)
+      .where(eq(jobRuns.id, jobRunId))
+      .limit(1);
+    const [connectivityResult] = await db
+      .select()
+      .from(connectivityResults)
+      .where(eq(connectivityResults.jobRunId, jobRunId))
+      .limit(1);
+    if (
+      !job ||
+      job.jobType !== "connectivity" ||
+      !connectivityResult ||
+      job.status === "sent"
+    ) {
+      throw new Error(
+        `Cannot resume connectivity job #${jobRunId}: saved ASA output is missing or the job is already complete`
+      );
+    }
+
+    const today = getAppDateString(job.createdAt ?? new Date());
+    const rawOutput = connectivityResult.rawOutput ?? "";
+    const parsed = parseIsakmpOutput(rawOutput);
+    const upCount = parsed.filter((entry) => entry.status === "UP").length;
+    const downCount = parsed.filter((entry) => entry.status === "DOWN").length;
+    const unknownCount = parsed.filter((entry) => entry.status === "UNKNOWN").length;
+    const html = buildConnectivityEmailHtml(today, job.adjustments ?? undefined);
+    const dateDisplay = format(parseISO(today), "do MMMM yyyy");
+    const subject = `Daily connectivity status check dated on the ${dateDisplay}`;
+    const retryBudget = createJobRetryBudget(job.retryCount);
+    const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
+      `ConnectivityJob #${jobRunId} resumed`,
+      retryBudget,
+      async () => {
+        const qadminCapture = await captureQadminQueueScreenshot();
+        let excelPath: string | undefined;
+        try {
+          excelPath = await appendConnectivitySheet(rawOutput, today);
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[ConnectivityJob #${jobRunId}] Excel error during resume:`, message);
+        }
+
+        const recipients = await getEmailRecipients();
+        const result = await sendEmail({
+          to: recipients.connectivityTo,
+          cc: recipients.connectivityCc,
+          subject,
+          html,
+          attachments: [
+            ...(excelPath ? [{ filename: `Connectivity_${today}.xlsx`, path: excelPath }] : []),
+            {
+              filename: "qadmin.png",
+              path: qadminCapture.screenshotPath,
+              cid: "qadmin",
+              contentDisposition: "inline",
+            },
+          ],
+        });
+        return { delivery: result, emailRecipients: recipients };
+      },
+      async (_attempt, error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const willRetry = retryBudget.retriesRemaining > 0;
+        await db
+          .update(jobRuns)
+          .set({
+            error: message,
+            status: willRetry ? "retrying" : "error",
+            ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
+            updatedAt: new Date(),
+          })
+          .where(eq(jobRuns.id, jobRunId));
+      }
+    );
+    emailAccepted = true;
+    const emailSentAt = new Date();
+    await db
+      .update(jobRuns)
+      .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+      .where(eq(jobRuns.id, jobRunId));
+    await sendNotification(
+      `✅ <b>Connectivity Email Accepted by SMTP</b>\n` +
+        `📅 ${today}\n` +
+        `✅ UP: ${upCount} | ❌ DOWN: ${downCount} | ❓ Unknown: ${unknownCount}\n` +
+        `📧 To: ${escapeTelegramHtml(emailRecipients.connectivityTo.join(", "))}\n` +
+        `📨 Accepted: ${escapeTelegramHtml(delivery.accepted.join(", "))}\n` +
+        `⚠️ Rejected: ${escapeTelegramHtml(delivery.rejected.join(", ") || "none")}\n` +
+        `🆔 Message ID: <code>${escapeTelegramHtml(delivery.messageId)}</code>\n` +
+        `<i>SMTP acceptance does not confirm Inbox delivery.</i>`
+    ).catch((error: unknown) =>
+      console.error(`[ConnectivityJob #${jobRunId}] Could not send success notification:`, error)
+    );
+  } catch (error: unknown) {
+    if (!emailAccepted) {
+      const message = error instanceof Error ? error.message : String(error);
+      await db
+        .update(jobRuns)
+        .set({ status: "error", error: message, updatedAt: new Date() })
+        .where(eq(jobRuns.id, jobRunId));
+      await sendNotification(
+        `❌ <b>Resumed Connectivity Job #${jobRunId} Failed</b>\n<code>${escapeTelegramHtml(message)}</code>`
+      );
+    }
+    throw error;
+  } finally {
+    markJobRunnerInactive(jobRunId);
+  }
+}
+
+registerJobResumer("connectivity", resumeApprovedConnectivityJob);

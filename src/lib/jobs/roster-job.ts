@@ -14,6 +14,7 @@ import {
   escapeTelegramHtml,
   markJobRunnerActive,
   markJobRunnerInactive,
+  registerJobResumer,
   sendConfirmationRequest,
   sendNotification,
 } from "@/lib/telegram";
@@ -373,6 +374,7 @@ export async function runRosterJob(
           );
         }
       }
+
     );
     emailAccepted = true;
 
@@ -422,3 +424,87 @@ export async function runRosterJob(
     markJobRunnerInactive(jobId);
   }
 }
+
+export async function resumeApprovedRosterJob(jobRunId: number): Promise<void> {
+  markJobRunnerActive(jobRunId);
+  let emailAccepted = false;
+  try {
+    const [job] = await db
+      .select()
+      .from(jobRuns)
+      .where(eq(jobRuns.id, jobRunId))
+      .limit(1);
+    if (!job || job.jobType !== "roster" || !Array.isArray(job.previewData)) {
+      throw new Error(`Cannot resume roster job #${jobRunId}: saved preview data is missing`);
+    }
+
+    const rosterList = job.previewData as RosterEntry[];
+    const adjustedList = job.adjustments
+      ? applyAdjustments(rosterList, job.adjustments)
+      : rosterList;
+    const today = getAppDateString(job.createdAt ?? new Date());
+    const html = buildRosterEmailHtml(adjustedList, today);
+    const subject = `Engineers Responsible for the ${format(parseISO(today), "dd.MM.yyyy")}`;
+    const retryBudget = createJobRetryBudget(job.retryCount);
+    const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
+      `RosterJob #${jobRunId} resumed`,
+      retryBudget,
+      async () => {
+        const recipients = await getEmailRecipients();
+        const result = await sendEmail({
+          to: recipients.rosterTo,
+          cc: recipients.rosterCc,
+          subject,
+          html,
+        });
+        return { delivery: result, emailRecipients: recipients };
+      },
+      async (_attempt, error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const willRetry = retryBudget.retriesRemaining > 0;
+        await db
+          .update(jobRuns)
+          .set({
+            error: message,
+            status: willRetry ? "retrying" : "error",
+            ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
+            updatedAt: new Date(),
+          })
+          .where(eq(jobRuns.id, jobRunId));
+      }
+    );
+    emailAccepted = true;
+    const emailSentAt = new Date();
+    await db
+      .update(jobRuns)
+      .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+      .where(eq(jobRuns.id, jobRunId));
+    await sendNotification(
+      `✅ <b>Roster Email Accepted by SMTP</b>\n` +
+        `📅 ${today}\n👥 ${adjustedList.length} staff\n` +
+        `📧 To: ${escapeTelegramHtml(emailRecipients.rosterTo.join(", "))}\n` +
+        `📨 Accepted: ${escapeTelegramHtml(delivery.accepted.join(", "))}\n` +
+        `⚠️ Rejected: ${escapeTelegramHtml(delivery.rejected.join(", ") || "none")}\n` +
+        `🆔 Message ID: <code>${escapeTelegramHtml(delivery.messageId)}</code>\n` +
+        `<i>SMTP acceptance does not confirm Inbox delivery.</i>`
+    ).catch((error: unknown) =>
+      console.error(`[RosterJob #${jobRunId}] Could not send success notification:`, error)
+    );
+  } catch (error: unknown) {
+    if (!emailAccepted) {
+      const message = error instanceof Error ? error.message : String(error);
+      await db
+        .update(jobRuns)
+        .set({ status: "error", error: message, updatedAt: new Date() })
+        .where(eq(jobRuns.id, jobRunId));
+      await sendNotification(
+        `❌ <b>Resumed Roster Job #${jobRunId} Failed</b>\n<code>${escapeTelegramHtml(message)}</code>`
+      );
+    }
+    throw error;
+  } finally {
+    markJobRunnerInactive(jobRunId);
+  }
+}
+
+registerJobResumer("roster", resumeApprovedRosterJob);

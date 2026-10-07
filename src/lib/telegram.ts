@@ -62,7 +62,15 @@ interface PendingEntry {
 
 const pendingConfirmations = new Map<number, PendingEntry>();
 const activeJobRunners = new Set<number>();
+const jobResumers = new Map<"roster" | "connectivity", (jobRunId: number) => Promise<void>>();
 let _handlersRegistered = false;
+
+export function registerJobResumer(
+  jobType: "roster" | "connectivity",
+  resume: (jobRunId: number) => Promise<void>
+): void {
+  jobResumers.set(jobType, resume);
+}
 
 export function markJobRunnerActive(jobRunId: number): void {
   activeJobRunners.add(jobRunId);
@@ -124,7 +132,11 @@ export function initConfirmationHandlers() {
 
     if (!activeJobRunners.has(jobRunId)) {
       const [currentJob] = await db
-        .select({ status: jobRuns.status })
+        .select({
+          status: jobRuns.status,
+          jobType: jobRuns.jobType,
+          error: jobRuns.error,
+        })
         .from(jobRuns)
         .where(eq(jobRuns.id, jobRunId))
         .limit(1);
@@ -137,30 +149,60 @@ export function initConfirmationHandlers() {
         return;
       }
 
-      const [interruptedJob] = await db
-        .update(jobRuns)
-        .set({
-          status: "error",
-          error: "Confirmation was clicked after the app restarted; the in-memory job runner is no longer active. Trigger the job again.",
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(jobRuns.id, jobRunId),
-            or(
-              eq(jobRuns.status, "waiting_confirm"),
-              eq(jobRuns.status, "waiting_adjustment"),
-              eq(jobRuns.status, "confirmed")
+      const resumer = currentJob?.jobType === "roster" || currentJob?.jobType === "connectivity"
+        ? jobResumers.get(currentJob.jobType)
+        : undefined;
+      const wasMarkedInterrupted =
+        currentJob?.status === "error" &&
+        currentJob.error?.startsWith("Confirmation was clicked after the app restarted;");
+      const canResume =
+        action === "approve" &&
+        resumer &&
+        (currentJob?.status === "waiting_confirm" ||
+          currentJob?.status === "confirmed" ||
+          currentJob?.status === "retrying" ||
+          wasMarkedInterrupted);
+
+      if (canResume) {
+        const resumableStatuses = ["waiting_confirm", "confirmed", "retrying"];
+        const [resumedJob] = await db
+          .update(jobRuns)
+          .set({ status: "confirmed", error: null, updatedAt: new Date() })
+          .where(
+            and(
+              eq(jobRuns.id, jobRunId),
+              or(
+                ...resumableStatuses.map((status) => eq(jobRuns.status, status)),
+                ...(wasMarkedInterrupted ? [eq(jobRuns.status, "error")] : [])
+              )
             )
           )
-        )
-        .returning({ id: jobRuns.id });
+          .returning({ id: jobRuns.id });
+
+        if (resumedJob) {
+          await bot.api.sendMessage({
+            chat_id: chatId,
+            text: `Approval accepted. Resuming Job #${jobRunId} and its email delivery now.`,
+          });
+          void resumer(jobRunId).catch((error: unknown) =>
+            console.error(`[Telegram] Could not resume job #${jobRunId}:`, error)
+          );
+          return;
+        }
+      }
+
+      if (action === "reject" && currentJob?.status === "waiting_confirm") {
+        await db
+          .update(jobRuns)
+          .set({ status: "rejected", updatedAt: new Date() })
+          .where(and(eq(jobRuns.id, jobRunId), eq(jobRuns.status, "waiting_confirm")));
+        await bot.api.sendMessage({ chat_id: chatId, text: `Job #${jobRunId} was cancelled.` });
+        return;
+      }
 
       await bot.api.sendMessage({
         chat_id: chatId,
-        text: interruptedJob
-          ? `The app restarted while Job #${jobRunId} was waiting or processing, so its confirmation cannot resume the email. The job is marked failed; trigger it again from the dashboard.`
-          : `Job #${jobRunId} has no active confirmation process. Refresh the dashboard and check its current status.`,
+        text: `Job #${jobRunId} has no active runner to handle this action. Refresh the dashboard; if it is failed, trigger it again.`,
       });
       return;
     }

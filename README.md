@@ -54,5 +54,7 @@ while a retry is in progress. Failures before approval other than QAdmin
 capture (for example, missing roster data) are not auto-retried.
 SMTP connections time out after 30 seconds and inactive sends time out after
 60 seconds, allowing a stalled send to enter the retry flow. If the app restarts
-while a confirmation is pending or a job is processing, that in-memory run
-cannot resume; trigger a new job from the dashboard.
+while a confirmation is pending, clicking Approve after the app starts again
+resumes delivery from the job's saved preview/ASA data. If a restart interrupts
+delivery after approval and removes the confirmation buttons, trigger a new job
+from the dashboard.
