@@ -12,6 +12,9 @@ export function getTransporter(): Transporter {
       host: cfg.smtp.host,
       port: cfg.smtp.port,
       secure: cfg.smtp.secure,
+      connectionTimeout: 30_000,
+      greetingTimeout: 30_000,
+      socketTimeout: 60_000,
       auth: {
         user: cfg.smtp.user,
         pass: cfg.smtp.pass,

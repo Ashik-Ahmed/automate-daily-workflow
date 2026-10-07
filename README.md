@@ -17,6 +17,10 @@ from the environment or Next.js environment files (`.env`, `.env.local`, and
 related files); verify that it points to the intended database before running
 it. Take a database backup first if the database already contains data.
 
+After updating to a release that adds database fields, run `npm run db:push`
+against the intended database before restarting the app. The retry-count column
+is added to `job_runs`; existing job rows default to zero retries.
+
 After the schema is set up, start the app normally:
 
 ```sh
@@ -48,3 +52,7 @@ and shares that job's retry budget with email delivery. The job history retains
 the most recent retry error while work is pending. Keep the app process running
 while a retry is in progress. Failures before approval other than QAdmin
 capture (for example, missing roster data) are not auto-retried.
+SMTP connections time out after 30 seconds and inactive sends time out after
+60 seconds, allowing a stalled send to enter the retry flow. If the app restarts
+while a confirmation is pending or a job is processing, that in-memory run
+cannot resume; trigger a new job from the dashboard.

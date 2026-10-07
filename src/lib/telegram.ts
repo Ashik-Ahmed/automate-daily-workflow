@@ -61,7 +61,16 @@ interface PendingEntry {
 }
 
 const pendingConfirmations = new Map<number, PendingEntry>();
+const activeJobRunners = new Set<number>();
 let _handlersRegistered = false;
+
+export function markJobRunnerActive(jobRunId: number): void {
+  activeJobRunners.add(jobRunId);
+}
+
+export function markJobRunnerInactive(jobRunId: number): void {
+  activeJobRunners.delete(jobRunId);
+}
 
 export function escapeTelegramHtml(value: string): string {
   return value
@@ -110,6 +119,49 @@ export function initConfirmationHandlers() {
 
     if (!nextStatus) {
       await bot.api.sendMessage({ chat_id: chatId, text: "Unknown confirmation action." });
+      return;
+    }
+
+    if (!activeJobRunners.has(jobRunId)) {
+      const [currentJob] = await db
+        .select({ status: jobRuns.status })
+        .from(jobRuns)
+        .where(eq(jobRuns.id, jobRunId))
+        .limit(1);
+
+      if (currentJob?.status === "sent") {
+        await bot.api.sendMessage({
+          chat_id: chatId,
+          text: `Job #${jobRunId} has already been accepted by SMTP.`,
+        });
+        return;
+      }
+
+      const [interruptedJob] = await db
+        .update(jobRuns)
+        .set({
+          status: "error",
+          error: "Confirmation was clicked after the app restarted; the in-memory job runner is no longer active. Trigger the job again.",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(jobRuns.id, jobRunId),
+            or(
+              eq(jobRuns.status, "waiting_confirm"),
+              eq(jobRuns.status, "waiting_adjustment"),
+              eq(jobRuns.status, "confirmed")
+            )
+          )
+        )
+        .returning({ id: jobRuns.id });
+
+      await bot.api.sendMessage({
+        chat_id: chatId,
+        text: interruptedJob
+          ? `The app restarted while Job #${jobRunId} was waiting or processing, so its confirmation cannot resume the email. The job is marked failed; trigger it again from the dashboard.`
+          : `Job #${jobRunId} has no active confirmation process. Refresh the dashboard and check its current status.`,
+      });
       return;
     }
 
@@ -273,30 +325,31 @@ export async function sendConfirmationRequest(
       ],
     ],
   };
-  const result = options.photo
-    ? await bot.api.sendPhoto({
-        chat_id: chatId,
-        photo: new InputFile(options.photo, {
-          filename: "asa-output.png",
-          contentType: "image/png",
-        }),
-        caption: text,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      })
-    : await bot.api.sendMessage({
-        chat_id: chatId,
-        text,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      });
+  try {
+    const result = options.photo
+      ? await bot.api.sendPhoto({
+          chat_id: chatId,
+          photo: new InputFile(options.photo, {
+            filename: "asa-output.png",
+            contentType: "image/png",
+          }),
+          caption: text,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        })
+      : await bot.api.sendMessage({
+          chat_id: chatId,
+          text,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        });
 
-  await db
-    .update(jobRuns)
-    .set({ telegramMessageId: result.message_id, updatedAt: new Date() })
-    .where(eq(jobRuns.id, jobRunId));
+    await db
+      .update(jobRuns)
+      .set({ telegramMessageId: result.message_id, updatedAt: new Date() })
+      .where(eq(jobRuns.id, jobRunId));
 
-  return new Promise((resolve) => {
+    return await new Promise((resolve) => {
     let settled = false;
     const finish = (
       approved: boolean,
@@ -390,7 +443,11 @@ export async function sendConfirmationRequest(
         }
       }
     }, cfg.confirmTimeout);
-  });
+    });
+  } catch (error: unknown) {
+    pendingConfirmations.delete(jobRunId);
+    throw error;
+  }
 }
 
 /** Send a plain notification (no confirmation needed) */

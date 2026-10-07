@@ -49,6 +49,7 @@ export const jobRuns = pgTable("job_runs", {
   triggerType: text("trigger_type").notNull().default("scheduled"), // scheduled | manual
   previewData: jsonb("preview_data"),
   telegramMessageId: integer("telegram_message_id"),
+  retryCount: integer("retry_count").notNull().default(0),
   adjustments: text("adjustments"),
   emailSentAt: timestamp("email_sent_at"),
   error: text("error"),

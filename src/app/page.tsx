@@ -14,6 +14,7 @@ interface JobRun {
   adjustments: string | null;
   emailSentAt: string | null;
   error: string | null;
+  retryCount: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,6 +104,7 @@ const STATUS_COLORS: Record<string, string> = {
   waiting_confirm: "bg-blue-500/20 text-blue-300 border-blue-500/30",
   waiting_adjustment: "bg-yellow-500/20 text-yellow-300 border-yellow-500/30",
   confirmed: "bg-teal-500/20 text-teal-300 border-teal-500/30",
+  retrying: "bg-amber-500/20 text-amber-300 border-amber-500/30",
   sent: "bg-green-500/20 text-green-300 border-green-500/30",
   holiday: "bg-slate-500/20 text-slate-300 border-slate-500/30",
   rejected: "bg-orange-500/20 text-orange-300 border-orange-500/30",
@@ -114,6 +116,7 @@ const STATUS_ICONS: Record<string, string> = {
   waiting_confirm: "💬",
   waiting_adjustment: "✏️",
   confirmed: "✅",
+  retrying: "↻",
   sent: "📧",
   holiday: "🏖️",
   rejected: "❌",
@@ -126,6 +129,20 @@ function StatusBadge({ status }: { status: string }) {
       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border font-medium ${STATUS_COLORS[status] ?? "bg-slate-500/20 text-slate-300 border-slate-500/30"}`}
     >
       {STATUS_ICONS[status] ?? "•"} {status === "sent" ? "SMTP accepted" : status.replace("_", " ")}
+    </span>
+  );
+}
+
+function RetryCell({ job }: { job: JobRun }) {
+  return (
+    <span className="inline-flex items-center gap-2 whitespace-nowrap">
+      <span className="font-mono text-slate-300">{job.retryCount ?? 0}</span>
+      {job.status === "retrying" && (
+        <span className="inline-flex items-center gap-1 text-amber-300" role="status">
+          <span className="animate-spin" aria-hidden="true">↻</span>
+          Retrying…
+        </span>
+      )}
     </span>
   );
 }
@@ -621,6 +638,7 @@ function DashboardTab({
                   <th className="text-left pb-3">ID</th>
                   <th className="text-left pb-3">Type</th>
                   <th className="text-left pb-3">Status</th>
+                  <th className="text-left pb-3">Retries</th>
                   <th className="text-left pb-3">Trigger</th>
                   <th className="text-left pb-3">Started</th>
                   <th className="text-left pb-3">Adjustments</th>
@@ -637,6 +655,9 @@ function DashboardTab({
                     </td>
                     <td className="py-3">
                       <StatusBadge status={job.status} />
+                    </td>
+                    <td className="py-3 text-xs">
+                      <RetryCell job={job} />
                     </td>
                     <td className="py-3 text-slate-400 capitalize">{job.triggerType}</td>
                     <td className="py-3 text-slate-400 text-xs">
@@ -1101,7 +1122,7 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
   return (
     <Card title="Job History" icon="📜">
       <div className="flex flex-wrap gap-2 mb-5">
-        {["all", "roster", "connectivity", "sent", "holiday", "error", "rejected"].map((f) => (
+        {["all", "roster", "connectivity", "sent", "retrying", "holiday", "error", "rejected"].map((f) => (
           <button
             key={f}
             onClick={() => setFilter(f)}
@@ -1132,6 +1153,7 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
                 <th className="text-left pb-3 pr-4">ID</th>
                 <th className="text-left pb-3 pr-4">Type</th>
                 <th className="text-left pb-3 pr-4">Status</th>
+                <th className="text-left pb-3 pr-4">Retries</th>
                 <th className="text-left pb-3 pr-4">Trigger</th>
                 <th className="text-left pb-3 pr-4">Started</th>
                 <th className="text-left pb-3 pr-4">Email Sent</th>
@@ -1149,6 +1171,9 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
                   </td>
                   <td className="py-3 pr-4">
                     <StatusBadge status={job.status} />
+                  </td>
+                  <td className="py-3 pr-4 text-xs">
+                    <RetryCell job={job} />
                   </td>
                   <td className="py-3 pr-4 text-slate-400 capitalize text-xs">{job.triggerType}</td>
                   <td className="py-3 pr-4 text-slate-400 text-xs whitespace-nowrap">

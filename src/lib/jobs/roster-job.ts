@@ -6,11 +6,17 @@
  * 4. Send email to management
  */
 
-import { asc, eq, and } from "drizzle-orm";
+import { asc, eq, and, sql } from "drizzle-orm";
 import { format, parseISO } from "date-fns";
 import { db } from "@/db";
 import { rosterEntries, jobRuns } from "@/db/schema";
-import { escapeTelegramHtml, sendConfirmationRequest, sendNotification } from "@/lib/telegram";
+import {
+  escapeTelegramHtml,
+  markJobRunnerActive,
+  markJobRunnerInactive,
+  sendConfirmationRequest,
+  sendNotification,
+} from "@/lib/telegram";
 import { sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { isHoliday } from "@/lib/holiday-calendar";
@@ -235,6 +241,7 @@ export async function runRosterJob(
   const retryBudget = createJobRetryBudget();
   let emailAccepted = false;
   let retryNoticeSent = false;
+  markJobRunnerActive(jobId);
 
   try {
     const holiday = await isHoliday(today);
@@ -326,14 +333,14 @@ export async function runRosterJob(
     // Build & send email
     const html = buildRosterEmailHtml(rosterList, today);
     const subject = `Engineers Responsible for the ${format(parseISO(today), "dd.MM.yyyy")}`;
+    await db
+      .update(jobRuns)
+      .set({ status: "confirmed", adjustments: adjustment, updatedAt: new Date() })
+      .where(eq(jobRuns.id, jobId));
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `RosterJob #${jobId}`,
       retryBudget,
       async () => {
-        await db
-          .update(jobRuns)
-          .set({ status: "confirmed", adjustments: adjustment, updatedAt: new Date() })
-          .where(eq(jobRuns.id, jobId));
         const recipients = await getEmailRecipients();
         const result = await sendEmail({
           to: recipients.rosterTo,
@@ -345,16 +352,22 @@ export async function runRosterJob(
       },
       async (attempt, error) => {
         const message = error instanceof Error ? error.message : String(error);
+        const willRetry = retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
-          .set({ error: message })
+          .set({
+            error: message,
+            status: willRetry ? "retrying" : "error",
+            ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
+            updatedAt: new Date(),
+          })
           .where(eq(jobRuns.id, jobId));
         if (!retryNoticeSent) {
           retryNoticeSent = true;
-          const retryStatus =
-            retryBudget.retriesRemaining > 0
-              ? "Retrying immediately."
-              : "No retries remain; the job will be marked failed.";
+          const retriesRemaining = retryBudget.retriesRemaining;
+          const retryStatus = willRetry
+            ? `Retrying immediately (${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
+            : "No retries remain; the job will be marked failed.";
           await sendNotification(
             `⚠️ <b>Roster Job #${jobId}</b>: Email attempt ${attempt} failed. ${retryStatus}\n<code>${escapeTelegramHtml(message)}</code>`
           );
@@ -405,5 +418,7 @@ export async function runRosterJob(
     await sendNotification(
       `❌ <b>Roster Job #${jobId} Failed</b>\n<code>${msg}</code>`
     );
+  } finally {
+    markJobRunnerInactive(jobId);
   }
 }

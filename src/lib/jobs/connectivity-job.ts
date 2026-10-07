@@ -9,8 +9,14 @@
 import { format, parseISO } from "date-fns";
 import { db } from "@/db";
 import { jobRuns, connectivityResults } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { escapeTelegramHtml, sendConfirmationRequest, sendNotification } from "@/lib/telegram";
+import { eq, sql } from "drizzle-orm";
+import {
+  escapeTelegramHtml,
+  markJobRunnerActive,
+  markJobRunnerInactive,
+  sendConfirmationRequest,
+  sendNotification,
+} from "@/lib/telegram";
 import { sendEmail } from "@/lib/mailer";
 import { fetchAsaConnectivity, parseIsakmpOutput } from "@/lib/ssh-asa";
 import { appendConnectivitySheet } from "@/lib/excel";
@@ -97,6 +103,7 @@ export async function runConnectivityJob(
   const retryBudget = createJobRetryBudget();
   let emailAccepted = false;
   let deliveryRetryNoticeSent = false;
+  markJobRunnerActive(jobId);
 
   try {
     const holiday = await isHoliday(today);
@@ -153,9 +160,15 @@ export async function runConnectivityJob(
       () => captureQadminQueueScreenshot(),
       async (_attempt, error) => {
         const message = error instanceof Error ? error.message : String(error);
+        const willRetry = retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
-          .set({ error: message, updatedAt: new Date() })
+          .set({
+            error: message,
+            status: willRetry ? "retrying" : "error",
+            ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
+            updatedAt: new Date(),
+          })
           .where(eq(jobRuns.id, jobId));
       }
     );
@@ -193,14 +206,14 @@ export async function runConnectivityJob(
     const html = buildConnectivityEmailHtml(today, adjustment);
     const dateDisplay = format(parseISO(today), "do MMMM yyyy");
     const subject = `Daily connectivity status check dated on the ${dateDisplay}`;
+    await db
+      .update(jobRuns)
+      .set({ status: "confirmed", updatedAt: new Date() })
+      .where(eq(jobRuns.id, jobId));
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `ConnectivityJob #${jobId}`,
       retryBudget,
       async () => {
-        await db
-          .update(jobRuns)
-          .set({ status: "confirmed", updatedAt: new Date() })
-          .where(eq(jobRuns.id, jobId));
         let excelPath: string | undefined;
         try {
           excelPath = await appendConnectivitySheet(asaResult.output, today);
@@ -233,16 +246,22 @@ export async function runConnectivityJob(
       },
       async (attempt, error) => {
         const message = error instanceof Error ? error.message : String(error);
+        const willRetry = retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
-          .set({ error: message })
+          .set({
+            error: message,
+            status: willRetry ? "retrying" : "error",
+            ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
+            updatedAt: new Date(),
+          })
           .where(eq(jobRuns.id, jobId));
         if (!deliveryRetryNoticeSent) {
           deliveryRetryNoticeSent = true;
-          const retryStatus =
-            retryBudget.retriesRemaining > 0
-              ? "Retrying immediately."
-              : "No retries remain; the job will be marked failed.";
+          const retriesRemaining = retryBudget.retriesRemaining;
+          const retryStatus = willRetry
+            ? `Retrying immediately (${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
+            : "No retries remain; the job will be marked failed.";
           await sendNotification(
             `⚠️ <b>Connectivity Job #${jobId}</b>: Delivery attempt ${attempt} failed. ${retryStatus}\n<code>${escapeTelegramHtml(message)}</code>`
           );
@@ -297,5 +316,7 @@ export async function runConnectivityJob(
     await sendNotification(
       `❌ <b>Connectivity Job #${jobId} Failed</b>\n<code>${msg}</code>`
     );
+  } finally {
+    markJobRunnerInactive(jobId);
   }
 }
