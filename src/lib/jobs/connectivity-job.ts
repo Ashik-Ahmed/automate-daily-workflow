@@ -27,7 +27,11 @@ import { captureQadminQueueScreenshot } from "@/lib/qadmin";
 import { isHoliday } from "@/lib/holiday-calendar";
 import { renderAsaOutputImage } from "@/lib/asa-output-image";
 import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
-import { createJobRetryBudget, retryImmediatelyUntilSuccessful } from "@/lib/job-retry";
+import {
+  claimJobDelivery,
+  createJobRetryBudget,
+  retryImmediatelyUntilSuccessful,
+} from "@/lib/job-retry";
 
 function buildConnectivityEmailHtml(
   checkDate: string,
@@ -207,10 +211,10 @@ export async function runConnectivityJob(
     const html = buildConnectivityEmailHtml(today, adjustment);
     const dateDisplay = format(parseISO(today), "do MMMM yyyy");
     const subject = `Daily connectivity status check dated on the ${dateDisplay}`;
-    await db
-      .update(jobRuns)
-      .set({ status: "confirmed", updatedAt: new Date() })
-      .where(eq(jobRuns.id, jobId));
+    if (!(await claimJobDelivery(jobId))) {
+      console.log(`[ConnectivityJob #${jobId}] Another runner already claimed delivery`);
+      return;
+    }
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `ConnectivityJob #${jobId}`,
       retryBudget,
@@ -346,6 +350,10 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
       throw new Error(
         `Cannot resume connectivity job #${jobRunId}: saved ASA output is missing or the job is already complete`
       );
+    }
+    if (!(await claimJobDelivery(jobRunId))) {
+      console.log(`[ConnectivityJob #${jobRunId}] Another runner already claimed delivery`);
+      return;
     }
 
     const today = getAppDateString(job.createdAt ?? new Date());

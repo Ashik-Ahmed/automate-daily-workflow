@@ -41,6 +41,9 @@ Run this again when upgrading Playwright. On Linux hosts that report missing
 shared libraries, install the browser's OS dependencies with
 `npx playwright install --with-deps chromium` (this may require administrator
 privileges), then restart the application.
+ASA output is sent to Telegram as a sequence of compact JPEG pages, followed by
+a separate approval message. This keeps image uploads small while retaining
+the complete report; the full ASA output is also stored in connectivity results.
 
 ## Approved job delivery retries
 
@@ -57,4 +60,5 @@ SMTP connections time out after 30 seconds and inactive sends time out after
 while a confirmation is pending, clicking Approve after the app starts again
 resumes delivery from the job's saved preview/ASA data. If a restart interrupts
 delivery after approval and removes the confirmation buttons, trigger a new job
-from the dashboard.
+from the dashboard. Email delivery is claimed atomically in the database so an
+original runner and a resumed runner cannot both send the same job.

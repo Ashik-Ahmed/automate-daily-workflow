@@ -160,11 +160,9 @@ export function initConfirmationHandlers() {
         resumer &&
         (currentJob?.status === "waiting_confirm" ||
           currentJob?.status === "confirmed" ||
-          currentJob?.status === "retrying" ||
           wasMarkedInterrupted);
 
       if (canResume) {
-        const resumableStatuses = ["waiting_confirm", "confirmed", "retrying"];
         const [resumedJob] = await db
           .update(jobRuns)
           .set({ status: "confirmed", error: null, updatedAt: new Date() })
@@ -172,7 +170,8 @@ export function initConfirmationHandlers() {
             and(
               eq(jobRuns.id, jobRunId),
               or(
-                ...resumableStatuses.map((status) => eq(jobRuns.status, status)),
+                eq(jobRuns.status, "waiting_confirm"),
+                eq(jobRuns.status, "confirmed"),
                 ...(wasMarkedInterrupted ? [eq(jobRuns.status, "error")] : [])
               )
             )
@@ -202,7 +201,10 @@ export function initConfirmationHandlers() {
 
       await bot.api.sendMessage({
         chat_id: chatId,
-        text: `Job #${jobRunId} has no active runner to handle this action. Refresh the dashboard; if it is failed, trigger it again.`,
+        text:
+          currentJob?.status === "sending" || currentJob?.status === "retrying"
+            ? `Job #${jobRunId} is already processing or retrying delivery. This click will not start another email send.`
+            : `Job #${jobRunId} has no active runner to handle this action. Refresh the dashboard; if it is failed, trigger it again.`,
       });
       return;
     }

@@ -104,6 +104,7 @@ const STATUS_COLORS: Record<string, string> = {
   waiting_confirm: "bg-blue-500/20 text-blue-300 border-blue-500/30",
   waiting_adjustment: "bg-yellow-500/20 text-yellow-300 border-yellow-500/30",
   confirmed: "bg-teal-500/20 text-teal-300 border-teal-500/30",
+  sending: "bg-cyan-500/20 text-cyan-300 border-cyan-500/30",
   retrying: "bg-amber-500/20 text-amber-300 border-amber-500/30",
   sent: "bg-green-500/20 text-green-300 border-green-500/30",
   holiday: "bg-slate-500/20 text-slate-300 border-slate-500/30",
@@ -116,6 +117,7 @@ const STATUS_ICONS: Record<string, string> = {
   waiting_confirm: "💬",
   waiting_adjustment: "✏️",
   confirmed: "✅",
+  sending: "↗",
   retrying: "↻",
   sent: "📧",
   holiday: "🏖️",
@@ -137,10 +139,12 @@ function RetryCell({ job }: { job: JobRun }) {
   return (
     <span className="inline-flex items-center gap-2 whitespace-nowrap">
       <span className="font-mono text-slate-300">{job.retryCount ?? 0}</span>
-      {job.status === "retrying" && (
+      {(job.status === "retrying" || job.status === "sending") && (
         <span className="inline-flex items-center gap-1 text-amber-300" role="status">
-          <span className="animate-spin" aria-hidden="true">↻</span>
-          Retrying…
+          <span className="animate-spin" aria-hidden="true">
+            {job.status === "retrying" ? "↻" : "↗"}
+          </span>
+          {job.status === "retrying" ? "Retrying…" : "Sending…"}
         </span>
       )}
     </span>

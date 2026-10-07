@@ -45,7 +45,7 @@ export const appConfig = pgTable("app_config", {
 export const jobRuns = pgTable("job_runs", {
   id: serial("id").primaryKey(),
   jobType: text("job_type").notNull(), // 'roster' | 'connectivity'
-  status: text("status").notNull().default("pending"), // pending | waiting_confirm | confirmed | rejected | sent | holiday | error
+  status: text("status").notNull().default("pending"), // pending | waiting_confirm | confirmed | sending | retrying | rejected | sent | holiday | error
   triggerType: text("trigger_type").notNull().default("scheduled"), // scheduled | manual
   previewData: jsonb("preview_data"),
   telegramMessageId: integer("telegram_message_id"),

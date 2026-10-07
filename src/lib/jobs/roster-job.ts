@@ -22,7 +22,11 @@ import { sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { isHoliday } from "@/lib/holiday-calendar";
 import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
-import { createJobRetryBudget, retryImmediatelyUntilSuccessful } from "@/lib/job-retry";
+import {
+  claimJobDelivery,
+  createJobRetryBudget,
+  retryImmediatelyUntilSuccessful,
+} from "@/lib/job-retry";
 
 export interface RosterEntry {
   employeeName: string;
@@ -336,8 +340,12 @@ export async function runRosterJob(
     const subject = `Engineers Responsible for the ${format(parseISO(today), "dd.MM.yyyy")}`;
     await db
       .update(jobRuns)
-      .set({ status: "confirmed", adjustments: adjustment, updatedAt: new Date() })
+      .set({ adjustments: adjustment, updatedAt: new Date() })
       .where(eq(jobRuns.id, jobId));
+    if (!(await claimJobDelivery(jobId))) {
+      console.log(`[RosterJob #${jobId}] Another runner already claimed delivery`);
+      return;
+    }
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `RosterJob #${jobId}`,
       retryBudget,
@@ -436,6 +444,10 @@ export async function resumeApprovedRosterJob(jobRunId: number): Promise<void> {
       .limit(1);
     if (!job || job.jobType !== "roster" || !Array.isArray(job.previewData)) {
       throw new Error(`Cannot resume roster job #${jobRunId}: saved preview data is missing`);
+    }
+    if (!(await claimJobDelivery(jobRunId))) {
+      console.log(`[RosterJob #${jobRunId}] Another runner already claimed delivery`);
+      return;
     }
 
     const rosterList = job.previewData as RosterEntry[];

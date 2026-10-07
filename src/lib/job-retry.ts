@@ -1,3 +1,7 @@
+import { and, eq } from "drizzle-orm";
+import { db } from "@/db";
+import { jobRuns } from "@/db/schema";
+
 export const MAX_JOB_RETRIES = 3;
 
 export interface JobRetryBudget {
@@ -8,6 +12,15 @@ export function createJobRetryBudget(retriesAlreadyUsed = 0): JobRetryBudget {
   return {
     retriesRemaining: Math.max(0, MAX_JOB_RETRIES - retriesAlreadyUsed),
   };
+}
+
+export async function claimJobDelivery(jobRunId: number): Promise<boolean> {
+  const [claimedJob] = await db
+    .update(jobRuns)
+    .set({ status: "sending", error: null, updatedAt: new Date() })
+    .where(and(eq(jobRuns.id, jobRunId), eq(jobRuns.status, "confirmed")))
+    .returning({ id: jobRuns.id });
+  return !!claimedJob;
 }
 
 export async function retryImmediatelyUntilSuccessful<T>(
