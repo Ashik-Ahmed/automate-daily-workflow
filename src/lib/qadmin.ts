@@ -23,6 +23,7 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
 
   const browser = await launchChromium();
   let stage = "open portal login page";
+  let loginAttempted = false;
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });
     page.setDefaultTimeout(30000);
@@ -31,6 +32,7 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
     const usernameField = page.locator(cfg.qadmin.usernameSelector).first();
     if (await usernameField.isVisible().catch(() => false)) {
       stage = "submit portal login";
+      loginAttempted = true;
       await usernameField.fill(cfg.qadmin.username);
       await page.locator(cfg.qadmin.passwordSelector).fill(cfg.qadmin.password);
       await Promise.all([
@@ -57,10 +59,17 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
     const pageState = await Promise.race([loginRedirect, queueReady]);
     if (pageState === "login") {
       const loginPath = new URL(page.url()).pathname;
+      if (!loginAttempted) {
+        throw new Error(
+          `QAdmin returned a login page instead of the queue page (${loginPath}), but the configured username selector ` +
+            `did not match the login form at QADMIN_BASE_URL (${cfg.qadmin.usernameSelector}). ` +
+            "No credentials were submitted. Check QADMIN_USERNAME_SELECTOR and QADMIN_PASSWORD_SELECTOR against the production login form."
+        );
+      }
       throw new Error(
-        `QAdmin returned a login page instead of the queue page (${loginPath}). ` +
-          "The session is not authenticated. Verify QADMIN_USERNAME and QADMIN_PASSWORD " +
-          "in the production app's environment, and confirm this account can open QADMIN_QUEUE_URL."
+        `QAdmin returned a login page instead of the queue page (${loginPath}) after the login form was submitted. ` +
+          "Check that the production app process has the current QADMIN_USERNAME and QADMIN_PASSWORD, " +
+          "and confirm this account is permitted to open QADMIN_QUEUE_URL."
       );
     }
 
