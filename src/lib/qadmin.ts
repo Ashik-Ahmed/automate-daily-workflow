@@ -22,8 +22,6 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
 
   const browser = await launchChromium();
-  let stage = "open portal login page";
-  let loginAttempted = false;
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });
     page.setDefaultTimeout(30000);
@@ -31,8 +29,6 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
     await page.goto(cfg.qadmin.baseUrl, { waitUntil: "domcontentloaded" });
     const usernameField = page.locator(cfg.qadmin.usernameSelector).first();
     if (await usernameField.isVisible().catch(() => false)) {
-      stage = "submit portal login";
-      loginAttempted = true;
       await usernameField.fill(cfg.qadmin.username);
       await page.locator(cfg.qadmin.passwordSelector).fill(cfg.qadmin.password);
       await Promise.all([
@@ -44,11 +40,9 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
       }
     }
 
-    stage = "navigate to queue page";
     await page.goto(cfg.qadmin.queueUrl, { waitUntil: "commit" });
     const queueSection = page.locator(cfg.qadmin.queueSelector).first();
 
-    stage = "wait for queue section";
     const loginRedirect = usernameField
       .waitFor({ state: "visible", timeout: 5000 })
       .then(() => "login" as const)
@@ -58,18 +52,8 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
       .then(() => "queue" as const);
     const pageState = await Promise.race([loginRedirect, queueReady]);
     if (pageState === "login") {
-      const loginPath = new URL(page.url()).pathname;
-      if (!loginAttempted) {
-        throw new Error(
-          `QAdmin returned a login page instead of the queue page (${loginPath}), but the configured username selector ` +
-            `did not match the login form at QADMIN_BASE_URL (${cfg.qadmin.usernameSelector}). ` +
-            "No credentials were submitted. Check QADMIN_USERNAME_SELECTOR and QADMIN_PASSWORD_SELECTOR against the production login form."
-        );
-      }
       throw new Error(
-        `QAdmin returned a login page instead of the queue page (${loginPath}) after the login form was submitted. ` +
-          "Check that the production app process has the current QADMIN_USERNAME and QADMIN_PASSWORD, " +
-          "and confirm this account is permitted to open QADMIN_QUEUE_URL."
+        "QAdmin authentication failed. Verify the configured credentials and confirm this account can access the queue page."
       );
     }
 
@@ -94,13 +78,12 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
       throw new Error("Queue table is visible, but no operator message counts could be read");
     }
 
-    stage = "save queue screenshot";
     await queueSection.screenshot({ path: outputPath, animations: "disabled" });
     console.log(`[QAdmin] Outgoing queue screenshot saved: ${outputPath}`);
     return { screenshotPath: outputPath, queueStatus };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Could not capture QAdmin outgoing queue while trying to ${stage}: ${message}`);
+    throw new Error(`Could not capture QAdmin outgoing queue: ${message}`);
   } finally {
     await browser.close();
   }

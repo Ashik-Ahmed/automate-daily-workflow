@@ -15,6 +15,7 @@ import { sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { isHoliday } from "@/lib/holiday-calendar";
 import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
+import { createJobRetryBudget, retryImmediatelyUntilSuccessful } from "@/lib/job-retry";
 
 export interface RosterEntry {
   employeeName: string;
@@ -231,6 +232,9 @@ export async function runRosterJob(
     .returning();
 
   const jobId = job!.id;
+  const retryBudget = createJobRetryBudget();
+  let emailAccepted = false;
+  let retryNoticeSent = false;
 
   try {
     const holiday = await isHoliday(today);
@@ -314,30 +318,65 @@ export async function runRosterJob(
       rosterList = applyAdjustments(rosterList, adjustment);
       await sendNotification(
         `✅ <b>Roster Job #${jobId}</b>: Adjustments applied. Sending email now…`
+      ).catch((notifyError: unknown) =>
+        console.error(`[RosterJob #${jobId}] Could not send adjustment notification:`, notifyError)
       );
     }
-
-    await db
-      .update(jobRuns)
-      .set({ status: "confirmed", adjustments: adjustment, updatedAt: new Date() })
-      .where(eq(jobRuns.id, jobId));
 
     // Build & send email
     const html = buildRosterEmailHtml(rosterList, today);
     const subject = `Engineers Responsible for the ${format(parseISO(today), "dd.MM.yyyy")}`;
-    const emailRecipients = await getEmailRecipients();
+    const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
+      `RosterJob #${jobId}`,
+      retryBudget,
+      async () => {
+        await db
+          .update(jobRuns)
+          .set({ status: "confirmed", adjustments: adjustment, updatedAt: new Date() })
+          .where(eq(jobRuns.id, jobId));
+        const recipients = await getEmailRecipients();
+        const result = await sendEmail({
+          to: recipients.rosterTo,
+          cc: recipients.rosterCc,
+          subject,
+          html,
+        });
+        return { delivery: result, emailRecipients: recipients };
+      },
+      async (attempt, error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        await db
+          .update(jobRuns)
+          .set({ error: message })
+          .where(eq(jobRuns.id, jobId));
+        if (!retryNoticeSent) {
+          retryNoticeSent = true;
+          const retryStatus =
+            retryBudget.retriesRemaining > 0
+              ? "Retrying immediately."
+              : "No retries remain; the job will be marked failed.";
+          await sendNotification(
+            `⚠️ <b>Roster Job #${jobId}</b>: Email attempt ${attempt} failed. ${retryStatus}\n<code>${escapeTelegramHtml(message)}</code>`
+          );
+        }
+      }
+    );
+    emailAccepted = true;
 
-    const delivery = await sendEmail({
-      to: emailRecipients.rosterTo,
-      cc: emailRecipients.rosterCc,
-      subject,
-      html,
-    });
-
-    await db
-      .update(jobRuns)
-      .set({ status: "sent", emailSentAt: new Date(), updatedAt: new Date() })
-      .where(eq(jobRuns.id, jobId));
+    const emailSentAt = new Date();
+    await retryImmediatelyUntilSuccessful(
+      `RosterJob #${jobId} completion update`,
+      retryBudget,
+      async () => {
+        await db
+          .update(jobRuns)
+          .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+          .where(eq(jobRuns.id, jobId));
+      },
+      async (attempt, error) => {
+        console.error(`[RosterJob #${jobId}] Could not record accepted email (attempt ${attempt}):`, error);
+      }
+    );
 
     await sendNotification(
       `✅ <b>Roster Email Accepted by SMTP</b>\n` +
@@ -347,11 +386,17 @@ export async function runRosterJob(
         `⚠️ Rejected: ${escapeTelegramHtml(delivery.rejected.join(", ") || "none")}\n` +
         `🆔 Message ID: <code>${escapeTelegramHtml(delivery.messageId)}</code>\n` +
         `<i>SMTP acceptance does not confirm Inbox delivery.</i>`
+    ).catch((notifyError: unknown) =>
+      console.error(`[RosterJob #${jobId}] Could not send success notification:`, notifyError)
     );
 
     console.log(`[RosterJob #${jobId}] Email sent successfully`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (emailAccepted) {
+      console.error(`[RosterJob #${jobId}] Email was accepted by SMTP, but post-delivery processing failed:`, msg);
+      return;
+    }
     console.error(`[RosterJob #${jobId}] Error:`, msg);
     await db
       .update(jobRuns)

@@ -37,3 +37,14 @@ Run this again when upgrading Playwright. On Linux hosts that report missing
 shared libraries, install the browser's OS dependencies with
 `npx playwright install --with-deps chromium` (this may require administrator
 privileges), then restart the application.
+
+## Approved job delivery retries
+
+After a roster or connectivity job is approved in Telegram, failures while
+preparing or sending its email are retried immediately without asking for
+approval again, with at most three retries (four attempts total) per job.
+Connectivity QAdmin capture happens before the Telegram confirmation prompt
+and shares that job's retry budget with email delivery. The job history retains
+the most recent retry error while work is pending. Keep the app process running
+while a retry is in progress. Failures before approval other than QAdmin
+capture (for example, missing roster data) are not auto-retried.
