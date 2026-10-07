@@ -3,7 +3,7 @@
  * Uses the new node-telegram-bot-api v2 (Bot class, Context, typed API).
  */
 
-import { Bot, Context } from "node-telegram-bot-api";
+import { Bot, Context, InputFile } from "node-telegram-bot-api";
 import { and, desc, eq, or } from "drizzle-orm";
 import { db } from "@/db";
 import { jobRuns } from "@/db/schema";
@@ -46,13 +46,18 @@ export async function startPolling() {
 }
 
 // ─── Pending confirmation map ─────────────────────────────────────────────────
-type ConfirmCallback = (approved: boolean, adjustment?: string) => void;
+type ConfirmCallback = (
+  approved: boolean,
+  adjustment?: string,
+  autoAccepted?: boolean
+) => void;
 
 interface PendingEntry {
   resolve: ConfirmCallback;
   messageId?: number;
   adjustmentPromptMessageId?: number;
   adjustmentMode: boolean;
+  isPhoto: boolean;
 }
 
 const pendingConfirmations = new Map<number, PendingEntry>();
@@ -126,15 +131,29 @@ export function initConfirmationHandlers() {
     if (action === "approve" || action === "reject") {
       pendingConfirmations.delete(jobRunId);
       entry?.resolve(action === "approve");
-      await bot.api.editMessageText({
-        chat_id: chatId,
-        message_id: query.message!.message_id,
-        text:
-          action === "approve"
-            ? `✅ <b>Approved!</b> Email will be sent now. (Job #${jobRunId})`
-            : `❌ <b>Cancelled.</b> Email was NOT sent. (Job #${jobRunId})`,
-        parse_mode: "HTML",
-      });
+      const finalText =
+        action === "approve"
+          ? `✅ <b>Approved!</b> Email will be sent now. (Job #${jobRunId})`
+          : `❌ <b>Cancelled.</b> Email was NOT sent. (Job #${jobRunId})`;
+      const messageId = query.message!.message_id;
+      const replyMarkup = { inline_keyboard: [] };
+      if (entry?.isPhoto || (query.message && "photo" in query.message)) {
+        await bot.api.editMessageCaption({
+          chat_id: chatId,
+          message_id: messageId,
+          caption: finalText,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        });
+      } else {
+        await bot.api.editMessageText({
+          chat_id: chatId,
+          message_id: messageId,
+          text: finalText,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        });
+      }
     } else {
       if (entry) entry.adjustmentMode = true;
       const adjustmentPrompt =
@@ -211,26 +230,39 @@ export function initConfirmationHandlers() {
 /** Send a preview message with ✅ Approve / ✏️ Changes / ❌ Cancel buttons */
 export async function sendConfirmationRequest(
   jobRunId: number,
-  text: string
-): Promise<{ approved: boolean; adjustment?: string }> {
+  text: string,
+  options: { photo?: Uint8Array } = {}
+): Promise<{ approved: boolean; adjustment?: string; autoAccepted?: boolean }> {
   const bot = getBot();
   const chatId = cfg.telegram.chatId;
   if (!chatId) throw new Error("TELEGRAM_CHAT_ID is not set");
 
-  const result = await bot.api.sendMessage({
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Send Email", callback_data: `approve:${jobRunId}` },
-          { text: "✏️ Request Changes", callback_data: `adjust:${jobRunId}` },
-          { text: "❌ Cancel", callback_data: `reject:${jobRunId}` },
-        ],
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: "✅ Send Email", callback_data: `approve:${jobRunId}` },
+        { text: "✏️ Request Changes", callback_data: `adjust:${jobRunId}` },
+        { text: "❌ Cancel", callback_data: `reject:${jobRunId}` },
       ],
-    },
-  });
+    ],
+  };
+  const result = options.photo
+    ? await bot.api.sendPhoto({
+        chat_id: chatId,
+        photo: new InputFile(options.photo, {
+          filename: "asa-output.png",
+          contentType: "image/png",
+        }),
+        caption: text,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      })
+    : await bot.api.sendMessage({
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      });
 
   await db
     .update(jobRuns)
@@ -239,19 +271,24 @@ export async function sendConfirmationRequest(
 
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (approved: boolean, adjustment?: string) => {
+    const finish = (
+      approved: boolean,
+      adjustment?: string,
+      autoAccepted = false
+    ) => {
       if (settled) return;
       settled = true;
       clearInterval(pollInterval);
       clearTimeout(timeout);
       pendingConfirmations.delete(jobRunId);
-      resolve({ approved, adjustment });
+      resolve({ approved, adjustment, autoAccepted });
     };
 
     pendingConfirmations.set(jobRunId, {
       resolve: finish,
       messageId: result.message_id,
       adjustmentMode: false,
+      isPhoto: !!options.photo,
     });
 
     const pollInterval = setInterval(async () => {
@@ -272,26 +309,58 @@ export async function sendConfirmationRequest(
     }, 1000);
 
     // Timeout after configured duration
-    const timeout = setTimeout(() => {
+    const timeout = setTimeout(async () => {
       if (!settled) {
-        void db
-          .update(jobRuns)
-          .set({ status: "rejected", updatedAt: new Date() })
-          .where(
-            and(
-              eq(jobRuns.id, jobRunId),
-              or(eq(jobRuns.status, "waiting_confirm"), eq(jobRuns.status, "waiting_adjustment"))
+        try {
+          const [autoApprovedJob] = await db
+            .update(jobRuns)
+            .set({ status: "confirmed", updatedAt: new Date() })
+            .where(
+              and(
+                eq(jobRuns.id, jobRunId),
+                or(
+                  eq(jobRuns.status, "waiting_confirm"),
+                  eq(jobRuns.status, "waiting_adjustment")
+                )
+              )
             )
+            .returning({ id: jobRuns.id });
+
+          if (autoApprovedJob) {
+            const timeoutMessage =
+              `⏰ <b>No response within ${Math.round(cfg.confirmTimeout / 60000)} minutes.</b>\n` +
+              `Automatically approved; processing the email now. (Job #${jobRunId})`;
+            const replyMarkup = { inline_keyboard: [] };
+            const editRequest = options.photo
+              ? bot.api.editMessageCaption({
+                  chat_id: chatId,
+                  message_id: result.message_id,
+                  caption: timeoutMessage,
+                  parse_mode: "HTML",
+                  reply_markup: replyMarkup,
+                })
+              : bot.api.editMessageText({
+                  chat_id: chatId,
+                  message_id: result.message_id,
+                  text: timeoutMessage,
+                  parse_mode: "HTML",
+                  reply_markup: replyMarkup,
+                });
+            await editRequest.catch((err: unknown) => {
+              console.error(
+                `[Telegram] Could not update auto-approved confirmation for job #${jobRunId}:`,
+                err
+              );
+            });
+            finish(true, undefined, true);
+          }
+        } catch (err: unknown) {
+          console.error(
+            `[Telegram] Could not auto-approve job #${jobRunId} after timeout:`,
+            err
           );
-        bot.api
-          .editMessageText({
-            chat_id: chatId,
-            message_id: result.message_id,
-            text: `⏰ <b>Confirmation timed out</b> — email was NOT sent (Job #${jobRunId})`,
-            parse_mode: "HTML",
-          })
-          .catch(() => null);
-        finish(false);
+          finish(false);
+        }
       }
     }, cfg.confirmTimeout);
   });

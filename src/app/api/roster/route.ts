@@ -8,14 +8,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { rosterEntries } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
-import { format } from "date-fns";
 import { normalizeRosterShift } from "@/lib/roster-shifts";
 import { isHoliday, saveHolidayDates } from "@/lib/holiday-calendar";
+import { getAppDateString } from "@/lib/app-time";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
-  const date = req.nextUrl.searchParams.get("date") ?? format(new Date(), "yyyy-MM-dd");
+  const date = req.nextUrl.searchParams.get("date") ?? getAppDateString();
   let rows = await db
     .select()
     .from(rosterEntries)
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
       Array.isArray(body) ? body : [body as { employeeName: string; shift?: string; date?: string; notes?: string }];
 
     for (const item of items) {
-      const date = item.date ?? format(new Date(), "yyyy-MM-dd");
+      const date = item.date ?? getAppDateString();
       const holiday = await isHoliday(date);
       if (holiday) {
         return NextResponse.json(
@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
         items.map((item) => ({
           employeeName: item.employeeName,
           shift: normalizeRosterShift(item.shift ?? "Daytime (Office)"),
-          date: item.date ?? format(new Date(), "yyyy-MM-dd"),
+          date: item.date ?? getAppDateString(),
           notes: item.notes ?? null,
         }))
       )

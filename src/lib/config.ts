@@ -57,9 +57,8 @@ export const cfg = {
   // Excel attachment
   excel: {
     filePath: process.env.CONNECTIVITY_EXCEL_PATH ?? "./data/connectivity.xlsx",
-    sheetPrefix: process.env.EXCEL_SHEET_PREFIX ?? "Connectivity",
   },
 
-  // Confirmation timeout (ms) — default 30 minutes
-  confirmTimeout: Number(process.env.CONFIRM_TIMEOUT_MS ?? 1800000),
+  // Telegram confirmations automatically approve after 10 minutes
+  confirmTimeout: 600000,
 };

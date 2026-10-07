@@ -7,6 +7,8 @@ import ExcelJS from "exceljs";
 import * as fs from "fs";
 import * as path from "path";
 import { cfg } from "./config";
+import { getReportableAsaOutput } from "./asa-output-image";
+import { format, parseISO } from "date-fns";
 
 const fixedPeerRows = [
   ["119.30.37.30", "10.10.16.76", "active (up)"],
@@ -47,8 +49,7 @@ export async function appendConnectivitySheet(
     await wb.xlsx.readFile(filePath);
   }
 
-  // Sheet name: "Connectivity 2024-01-15"
-  const sheetName = `${cfg.excel.sheetPrefix} ${checkDate}`;
+  const sheetName = format(parseISO(checkDate), "dd.MM.yyyy");
   // Remove old sheet with same name if re-running
   const existing = wb.getWorksheet(sheetName);
   if (existing) {
@@ -70,9 +71,21 @@ export async function appendConnectivitySheet(
     });
   });
 
-  rawOutput.split(/\r?\n/).forEach((line, index) => {
+  getReportableAsaOutput(rawOutput).split("\n").forEach((line, index) => {
     ws.getCell(index + 1, 5).value = line;
     ws.getCell(index + 1, 5).font = { name: "Arial", size: 10 };
+  });
+
+  ws.eachRow({ includeEmpty: false }, (row) => {
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      if (cell.value === null || cell.value === undefined || cell.value === "") return;
+      cell.border = {
+        top: { style: "thin", color: { argb: "FFD0D0D0" } },
+        left: { style: "thin", color: { argb: "FFD0D0D0" } },
+        bottom: { style: "thin", color: { argb: "FFD0D0D0" } },
+        right: { style: "thin", color: { argb: "FFD0D0D0" } },
+      };
+    });
   });
 
   ws.getColumn(1).width = 27;
@@ -80,7 +93,6 @@ export async function appendConnectivitySheet(
   ws.getColumn(3).width = 16;
   ws.getColumn(4).width = 3;
   ws.getColumn(5).width = 110;
-  ws.getColumn(5).width = 12;
 
   await wb.xlsx.writeFile(filePath);
   return filePath;

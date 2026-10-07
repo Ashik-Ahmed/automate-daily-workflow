@@ -8,6 +8,7 @@ import { runRosterJob } from "./jobs/roster-job";
 import { runConnectivityJob } from "./jobs/connectivity-job";
 import { initConfirmationHandlers, startPolling } from "./telegram";
 import { getScheduleWindow } from "./schedule-settings";
+import { APP_TIME_ZONE, getAppDateParts, getAppDateString, getAppMinuteOfDay } from "./app-time";
 
 const SCHEDULE_CRON = "* * * * *";
 
@@ -53,11 +54,7 @@ function maybeRunDaily(
   enabledDays: number[],
   runJob: () => void
 ): DailyRun | undefined {
-  const date = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-  ].join("-");
+  const date = getAppDateString(now);
   const scheduleKey = `${windowStart}-${windowEnd}:${[...enabledDays].sort((a, b) => a - b).join(",")}`;
   const nextRun =
     run?.date === date && run.scheduleKey === scheduleKey
@@ -70,11 +67,11 @@ function maybeRunDaily(
           dispatched: false,
         };
 
-  if (!enabledDays.includes(now.getDay())) {
+  if (!enabledDays.includes(getAppDateParts(now).weekday)) {
     return nextRun;
   }
 
-  const currentMinute = now.getHours() * 60 + now.getMinutes();
+  const currentMinute = getAppMinuteOfDay(now);
   if (!nextRun.dispatched && currentMinute > windowEnd) {
     nextRun.dispatched = true;
   }
@@ -89,7 +86,7 @@ function maybeRunDaily(
         Math.floor(Math.random() * (windowEnd - firstAvailableMinute + 1));
       nextRun.planned = true;
       console.log(
-        `[Scheduler] ${jobName} planned for ${date} at ${String(Math.floor(nextRun.minute / 60)).padStart(2, "0")}:${String(nextRun.minute % 60).padStart(2, "0")} server local time`
+        `[Scheduler] ${jobName} planned for ${date} at ${String(Math.floor(nextRun.minute / 60)).padStart(2, "0")}:${String(nextRun.minute % 60).padStart(2, "0")} Bangladesh time`
       );
     }
   }
@@ -111,11 +108,7 @@ function getRunStatus(
   now: Date,
   scheduleKey: string
 ) {
-  const date = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-  ].join("-");
+  const date = getAppDateString(now);
   return {
     date: run?.date === date && run.scheduleKey === scheduleKey ? date : null,
     plannedTime:
@@ -218,7 +211,7 @@ export async function initScheduler() {
       .finally(() => {
         schedulerState.checkingSchedule = false;
       });
-  });
+  }, { timezone: APP_TIME_ZONE });
   schedulerState.initialized = true;
   schedulerState.initializing = false;
   console.log("[Scheduler] Checking each minute against saved days and time window");

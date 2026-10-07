@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { ROSTER_SHIFT_OPTIONS } from "@/lib/roster-shifts";
+import { formatAppDateTime, formatJobStartedAt, getAppDateString } from "@/lib/app-time";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ interface JobRun {
   emailSentAt: string | null;
   error: string | null;
   createdAt: string;
+  updatedAt: string;
 }
 
 interface RosterEntry {
@@ -291,8 +293,12 @@ export default function Home() {
   };
 
   const recentJobs = jobs.slice(0, 5);
+  const appToday = getAppDateString();
   const sentToday = jobs.filter(
-    (j) => j.status === "sent" && j.emailSentAt?.startsWith(new Date().toISOString().slice(0, 10))
+    (j) =>
+      j.status === "sent" &&
+      j.emailSentAt &&
+      getAppDateString(new Date(j.emailSentAt)) === appToday
   ).length;
 
   return (
@@ -634,7 +640,7 @@ function DashboardTab({
                     </td>
                     <td className="py-3 text-slate-400 capitalize">{job.triggerType}</td>
                     <td className="py-3 text-slate-400 text-xs">
-                      {new Date(job.createdAt).toLocaleString()}
+                      {formatJobStartedAt(job.createdAt, job.updatedAt)}
                     </td>
                     <td className="py-3 text-slate-400 text-xs max-w-[200px] truncate">
                       {job.adjustments ?? "–"}
@@ -653,12 +659,12 @@ function DashboardTab({
 // ─── Roster Tab ───────────────────────────────────────────────────────────────
 
 function RosterTab({ showToast }: { showToast: (msg: string, type: "ok" | "err") => void }) {
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(getAppDateString());
   const [entries, setEntries] = useState<RosterEntry[]>([]);
   const [holidays, setHolidays] = useState<HolidayDate[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [holidayDate, setHolidayDate] = useState(new Date().toISOString().slice(0, 10));
+  const [holidayDate, setHolidayDate] = useState(getAppDateString());
   const [holidayName, setHolidayName] = useState("");
   const [holidayUploading, setHolidayUploading] = useState(false);
   const [newName, setNewName] = useState("");
@@ -1146,10 +1152,10 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
                   </td>
                   <td className="py-3 pr-4 text-slate-400 capitalize text-xs">{job.triggerType}</td>
                   <td className="py-3 pr-4 text-slate-400 text-xs whitespace-nowrap">
-                    {new Date(job.createdAt).toLocaleString()}
+                    {formatJobStartedAt(job.createdAt, job.updatedAt)}
                   </td>
                   <td className="py-3 pr-4 text-slate-400 text-xs whitespace-nowrap">
-                    {job.emailSentAt ? new Date(job.emailSentAt).toLocaleString() : "–"}
+                    {job.emailSentAt ? formatAppDateTime(job.emailSentAt) : "–"}
                   </td>
                   <td className="py-3 text-xs text-slate-500 max-w-[250px] truncate">
                     {job.error ? (
@@ -1209,8 +1215,8 @@ function ServerScheduleClock() {
     };
   }, []);
 
-  const formatTime = (value: Date, timeZone?: string) =>
-    new Intl.DateTimeFormat(undefined, {
+  const formatTime = (value: Date) =>
+    formatAppDateTime(value, {
       weekday: "long",
       year: "numeric",
       month: "long",
@@ -1219,8 +1225,7 @@ function ServerScheduleClock() {
       minute: "2-digit",
       second: "2-digit",
       timeZoneName: "short",
-      ...(timeZone ? { timeZone } : {}),
-    }).format(value);
+    });
 
   const serverNow = clock
     ? new Date(now - clock.offsetMs)
@@ -1254,12 +1259,12 @@ function ServerScheduleClock() {
         <>
           <div className="grid gap-2 sm:grid-cols-2">
             <p className="text-slate-300">
-              Server: <span className="font-medium text-white">{formatTime(serverNow, clock.status.serverTimeZone)}</span>
-              <span className="mt-1 block text-xs text-slate-500">{clock.status.serverTimeZone}</span>
+              Server: <span className="font-medium text-white">{formatTime(serverNow)}</span>
+              <span className="mt-1 block text-xs text-slate-500">Displayed in Bangladesh time ({clock.status.serverTimeZone})</span>
             </p>
             <p className="text-slate-300">
               This browser: <span className="font-medium text-white">{formatTime(new Date(now))}</span>
-              <span className="mt-1 block text-xs text-slate-500">{browserTimeZone}</span>
+              <span className="mt-1 block text-xs text-slate-500">Displayed in Bangladesh time; device zone: {browserTimeZone}</span>
             </p>
           </div>
           <p className="mt-3 text-xs text-slate-400">
@@ -1282,7 +1287,7 @@ function ServerScheduleClock() {
               : !clock.status.scheduler.initialized
               ? "Scheduler has not initialized in this server process."
               : clock.status.scheduler.lastCheckedAt
-              ? `Last checked: ${formatTime(new Date(clock.status.scheduler.lastCheckedAt), clock.status.serverTimeZone)}`
+              ? `Last checked: ${formatTime(new Date(clock.status.scheduler.lastCheckedAt))}`
               : "Scheduler is initialized; waiting for its first schedule check."}
           </p>
         </>
@@ -1346,7 +1351,7 @@ function SetupTab({
 
       <Card title="Automatic Job Schedule" icon="⏰">
         <p className="mb-4 text-sm text-slate-400">
-          Both jobs run at independently randomized times inside this window on the selected days, using server local time. Holiday-calendar dates are skipped.
+          Both jobs run at independently randomized times inside this window on the selected days, using Bangladesh time (Asia/Dhaka). Holiday-calendar dates are skipped.
         </p>
         <ServerScheduleClock />
         <div className="mb-5 grid gap-4 sm:grid-cols-2">
@@ -1474,12 +1479,8 @@ function SetupTab({
           {/* Excel */}
           <EnvSection title="📊 Excel File" color="green">
             <EnvVarRow envKey="CONNECTIVITY_EXCEL_PATH" example="./data/connectivity.xlsx" desc="Path to Excel file (will be created if not exists)" />
-            <EnvVarRow envKey="EXCEL_SHEET_PREFIX" example="Connectivity" desc="Sheet name prefix (e.g. 'Connectivity 2024-01-15')" />
           </EnvSection>
 
-          <EnvSection title="⚙️ General" color="purple">
-            <EnvVarRow envKey="CONFIRM_TIMEOUT_MS" example="1800000" desc="Telegram confirmation timeout in ms (default: 30 mins)" />
-          </EnvSection>
         </div>
       </Card>
 

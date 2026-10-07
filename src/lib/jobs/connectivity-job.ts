@@ -18,6 +18,8 @@ import { getEmailRecipients } from "@/lib/email-recipients";
 import { cfg } from "@/lib/config";
 import { captureQadminQueueScreenshot } from "@/lib/qadmin";
 import { isHoliday } from "@/lib/holiday-calendar";
+import { renderAsaOutputImage } from "@/lib/asa-output-image";
+import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
 
 function buildConnectivityEmailHtml(
   checkDate: string,
@@ -49,22 +51,23 @@ function escapeHtml(str: string): string {
 }
 
 function buildTelegramPreview(
-  rawOutput: string,
   checkDate: string,
   upCount: number,
   downCount: number
 ): string {
-  const dateDisplay = format(new Date(checkDate), "dd MMM yyyy (EEEE)");
-  // Truncate output for Telegram (max 4096 chars)
-  const truncated =
-    rawOutput.length > 2000 ? rawOutput.slice(0, 2000) + "\n…[truncated]" : rawOutput;
+  const dateDisplay = formatAppDateLabel(checkDate, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    weekday: "long",
+  });
 
   return (
     `🔗 <b>CONNECTIVITY CHECK PREVIEW</b>\n` +
     `📅 ${dateDisplay}\n\n` +
     `✅ <b>UP:</b> ${upCount} | ❌ <b>DOWN:</b> ${downCount}\n\n` +
-    `<b>📟 ASA Output (show crypto isakmp sa):</b>\n` +
-    `<pre>${escapeHtml(truncated)}</pre>\n\n` +
+    `<b>📟 ASA Output (show crypto isakmp sa)</b>\n` +
+    `The complete ASA output is attached as an image.\n\n` +
     `─────────────────\n` +
     `Approve to update Excel & send email to management.\n` +
     `Click <b>❌ Cancel</b> to abort.`
@@ -74,15 +77,18 @@ function buildTelegramPreview(
 export async function runConnectivityJob(
   triggerType: "scheduled" | "manual" = "scheduled"
 ): Promise<void> {
-  const today = format(new Date(), "yyyy-MM-dd");
+  const today = getAppDateString();
   console.log(`[ConnectivityJob] Starting for ${today}`);
 
+  const startedAt = new Date();
   const [job] = await db
     .insert(jobRuns)
     .values({
       jobType: "connectivity",
       status: "pending",
       triggerType,
+      createdAt: startedAt,
+      updatedAt: startedAt,
     })
     .returning();
 
@@ -145,13 +151,13 @@ export async function runConnectivityJob(
       .where(eq(jobRuns.id, jobId));
 
     // Step 2: Telegram preview
-    const previewText = buildTelegramPreview(
-      asaResult.output,
-      today,
-      upCount,
-      downCount
+    const previewText = buildTelegramPreview(today, upCount, downCount);
+    const asaOutputImage = await renderAsaOutputImage(asaResult.output);
+    const { approved, adjustment } = await sendConfirmationRequest(
+      jobId,
+      previewText,
+      { photo: asaOutputImage }
     );
-    const { approved, adjustment } = await sendConfirmationRequest(jobId, previewText);
 
     if (!approved) {
       await db

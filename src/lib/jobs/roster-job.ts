@@ -14,6 +14,7 @@ import { escapeTelegramHtml, sendConfirmationRequest, sendNotification } from "@
 import { sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { isHoliday } from "@/lib/holiday-calendar";
+import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
 
 export interface RosterEntry {
   employeeName: string;
@@ -185,7 +186,12 @@ function buildRosterEmailHtml(entries: RosterEntry[], date: string): string {
 }
 
 function buildTelegramPreview(entries: RosterEntry[], date: string): string {
-  const dateDisplay = format(new Date(date), "dd MMM yyyy (EEEE)");
+  const dateDisplay = formatAppDateLabel(date, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    weekday: "long",
+  });
   const shifts = [...new Set(entries.map((e) => e.shift))].sort();
   let text = `📋 <b>ROSTER EMAIL PREVIEW</b>\n📅 ${dateDisplay}\n\n`;
 
@@ -208,16 +214,19 @@ function buildTelegramPreview(entries: RosterEntry[], date: string): string {
 export async function runRosterJob(
   triggerType: "scheduled" | "manual" = "scheduled"
 ): Promise<void> {
-  const today = format(new Date(), "yyyy-MM-dd");
+  const today = getAppDateString();
   console.log(`[RosterJob] Starting for ${today}`);
 
   // Create job record
+  const startedAt = new Date();
   const [job] = await db
     .insert(jobRuns)
     .values({
       jobType: "roster",
       status: "pending",
       triggerType,
+      createdAt: startedAt,
+      updatedAt: startedAt,
     })
     .returning();
 
