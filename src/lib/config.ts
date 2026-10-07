@@ -60,12 +60,6 @@ export const cfg = {
     sheetPrefix: process.env.EXCEL_SHEET_PREFIX ?? "Connectivity",
   },
 
-  // Cron schedules (default: 8 AM daily)
-  cron: {
-    roster: process.env.CRON_ROSTER ?? "0 8 * * *",
-    connectivity: process.env.CRON_CONNECTIVITY ?? "0 8 * * *",
-  },
-
   // Confirmation timeout (ms) — default 30 minutes
   confirmTimeout: Number(process.env.CONFIRM_TIMEOUT_MS ?? 1800000),
 };

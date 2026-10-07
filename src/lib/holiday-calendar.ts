@@ -59,7 +59,7 @@ export async function deleteHolidayDate(value: string): Promise<void> {
   await db.delete(appConfig).where(eq(appConfig.key, `${HOLIDAY_KEY_PREFIX}${date}`));
 }
 
-export async function isRosterHoliday(date: string): Promise<HolidayDate | undefined> {
+export async function isHoliday(date: string): Promise<HolidayDate | undefined> {
   const [row] = await db
     .select({ key: appConfig.key, value: appConfig.value })
     .from(appConfig)

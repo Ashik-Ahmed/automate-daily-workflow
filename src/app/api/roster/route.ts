@@ -10,7 +10,7 @@ import { rosterEntries } from "@/db/schema";
 import { eq, inArray } from "drizzle-orm";
 import { format } from "date-fns";
 import { normalizeRosterShift } from "@/lib/roster-shifts";
-import { isRosterHoliday, saveHolidayDates } from "@/lib/holiday-calendar";
+import { isHoliday, saveHolidayDates } from "@/lib/holiday-calendar";
 
 export const dynamic = "force-dynamic";
 
@@ -47,7 +47,7 @@ export async function POST(req: NextRequest) {
 
     for (const item of items) {
       const date = item.date ?? format(new Date(), "yyyy-MM-dd");
-      const holiday = await isRosterHoliday(date);
+      const holiday = await isHoliday(date);
       if (holiday) {
         return NextResponse.json(
           { ok: false, error: `${date} is ${holiday.name}; roster entries cannot be added for a holiday` },

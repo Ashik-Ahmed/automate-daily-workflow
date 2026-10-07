@@ -41,7 +41,7 @@ interface SystemConfig {
   smtp: { host: string; user: string; ok: boolean };
   telegram: { chatId: string; ok: boolean };
   asa: { host: string; ok: boolean };
-  schedule: { roster: string; connectivity: string };
+  schedule: { start: string; end: string; days: number[]; roster: string; connectivity: string };
   email: { rosterTo: string[]; rosterCc: string[]; connectivityTo: string[]; connectivityCc: string[] };
 }
 
@@ -51,6 +51,40 @@ interface EmailRecipientForm {
   connectivityTo: string;
   connectivityCc: string;
 }
+
+interface ScheduleWindow {
+  start: string;
+  end: string;
+  days: number[];
+}
+
+interface SchedulerStatusResponse {
+  serverTime: string;
+  serverTimeZone: string;
+  schedule: ScheduleWindow;
+  scheduler: {
+    initialized: boolean;
+    initializing: boolean;
+    lastCheckedAt: string | null;
+    lastError: string | null;
+    selectedToday: boolean;
+    serverMinuteOfDay: number;
+    windowStartMinute: number;
+    windowEndMinute: number;
+    roster: { date: string | null; plannedTime: string | null; dispatched: boolean };
+    connectivity: { date: string | null; plannedTime: string | null; dispatched: boolean };
+  };
+}
+
+const SCHEDULE_DAYS = [
+  { value: 0, label: "Sunday" },
+  { value: 1, label: "Monday" },
+  { value: 2, label: "Tuesday" },
+  { value: 3, label: "Wednesday" },
+  { value: 4, label: "Thursday" },
+  { value: 5, label: "Friday" },
+  { value: 6, label: "Saturday" },
+];
 
 interface ConnectivityResult {
   id: number;
@@ -159,6 +193,12 @@ export default function Home() {
   const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
   const [savingRecipients, setSavingRecipients] = useState(false);
+  const [savingSchedule, setSavingSchedule] = useState(false);
+  const [scheduleWindow, setScheduleWindow] = useState<ScheduleWindow>({
+    start: "08:30",
+    end: "08:50",
+    days: [0, 1, 2, 3, 4],
+  });
 
   const showToast = (msg: string, type: "ok" | "err" = "ok") => {
     setToast({ msg, type });
@@ -172,7 +212,15 @@ export default function Home() {
 
   const fetchConfig = useCallback(async () => {
     const res = await fetch("/api/config");
-    if (res.ok) setSysConfig(await res.json() as SystemConfig);
+    if (res.ok) {
+      const config = await res.json() as SystemConfig;
+      setSysConfig(config);
+      setScheduleWindow({
+        start: config.schedule.start,
+        end: config.schedule.end,
+        days: config.schedule.days,
+      });
+    }
   }, []);
 
   const saveEmailRecipients = async (email: EmailRecipientForm) => {
@@ -191,6 +239,25 @@ export default function Home() {
       showToast(err instanceof Error ? err.message : String(err), "err");
     } finally {
       setSavingRecipients(false);
+    }
+  };
+
+  const saveSchedule = async (schedule: ScheduleWindow) => {
+    setSavingSchedule(true);
+    try {
+      const res = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ schedule }),
+      });
+      const data = await res.json() as { error?: string };
+      if (!res.ok) throw new Error(data.error ?? "Could not save schedule");
+      await fetchConfig();
+      showToast("Automatic job schedule saved");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : String(err), "err");
+    } finally {
+      setSavingSchedule(false);
     }
   };
 
@@ -336,6 +403,10 @@ export default function Home() {
             sysConfig={sysConfig}
             savingRecipients={savingRecipients}
             onSaveRecipients={saveEmailRecipients}
+            scheduleWindow={scheduleWindow}
+            setScheduleWindow={setScheduleWindow}
+            savingSchedule={savingSchedule}
+            onSaveSchedule={saveSchedule}
           />
         )}
       </main>
@@ -1099,14 +1170,143 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
 
 // ─── Setup Tab ────────────────────────────────────────────────────────────────
 
+function ServerScheduleClock() {
+  const [clock, setClock] = useState<{
+    status: SchedulerStatusResponse;
+    offsetMs: number;
+  } | null>(null);
+  const [now, setNow] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      try {
+        const response = await fetch("/api/schedule/status", { cache: "no-store" });
+        const data = await response.json() as SchedulerStatusResponse & { error?: string };
+        if (!response.ok) throw new Error(data.error ?? "Could not read server schedule status");
+        if (active) {
+          const receivedAt = Date.now();
+          setNow(receivedAt);
+          setClock({
+            status: data,
+            offsetMs: receivedAt - Date.parse(data.serverTime),
+          });
+          setError(null);
+        }
+      } catch (err: unknown) {
+        if (active) setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+
+    void refresh();
+    const refreshInterval = setInterval(() => void refresh(), 10000);
+    const clockInterval = setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      active = false;
+      clearInterval(refreshInterval);
+      clearInterval(clockInterval);
+    };
+  }, []);
+
+  const formatTime = (value: Date, timeZone?: string) =>
+    new Intl.DateTimeFormat(undefined, {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+      ...(timeZone ? { timeZone } : {}),
+    }).format(value);
+
+  const serverNow = clock
+    ? new Date(now - clock.offsetMs)
+    : undefined;
+  const clockDifferenceSeconds = clock
+    ? Math.round(-clock.offsetMs / 1000)
+    : undefined;
+  const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const scheduleRun = (job: SchedulerStatusResponse["scheduler"]["roster"]) => {
+    if (job.dispatched) return "Dispatched";
+    if (job.plannedTime) return `Planned today at ${job.plannedTime}`;
+    if (!clock?.status.scheduler.selectedToday) return "Not scheduled today";
+    if (clock.status.scheduler.serverMinuteOfDay < clock.status.scheduler.windowStartMinute) {
+      return `Waiting for ${clock.status.schedule.start}`;
+    }
+    if (clock.status.scheduler.serverMinuteOfDay > clock.status.scheduler.windowEndMinute) {
+      return "Today's schedule window has passed";
+    }
+    return "Waiting for scheduler check";
+  };
+  const differenceSeconds = clockDifferenceSeconds ?? 0;
+
+  return (
+    <div className="mb-5 rounded-xl border border-slate-700 bg-slate-800/50 p-4 text-sm">
+      <p className="mb-2 font-semibold text-slate-200">Server clock and scheduler</p>
+      {error ? (
+        <p className="text-red-300">Unable to read server clock: {error}</p>
+      ) : !clock || !serverNow ? (
+        <p className="text-slate-400">Reading server clock…</p>
+      ) : (
+        <>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <p className="text-slate-300">
+              Server: <span className="font-medium text-white">{formatTime(serverNow, clock.status.serverTimeZone)}</span>
+              <span className="mt-1 block text-xs text-slate-500">{clock.status.serverTimeZone}</span>
+            </p>
+            <p className="text-slate-300">
+              This browser: <span className="font-medium text-white">{formatTime(new Date(now))}</span>
+              <span className="mt-1 block text-xs text-slate-500">{browserTimeZone}</span>
+            </p>
+          </div>
+          <p className="mt-3 text-xs text-slate-400">
+            Clock difference (server vs browser):{" "}
+            <span className={Math.abs(differenceSeconds) > 60 ? "text-amber-300" : "text-green-300"}>
+              {Math.abs(differenceSeconds) <= 60
+                ? "within 1 minute"
+                : `${differenceSeconds > 0 ? "+" : "−"}${Math.floor(Math.abs(differenceSeconds) / 60)}m ${Math.abs(differenceSeconds) % 60}s`}
+            </span>
+          </p>
+          <div className="mt-3 grid gap-2 border-t border-slate-700 pt-3 sm:grid-cols-2">
+            <p className="text-xs text-slate-400">Roster: {scheduleRun(clock.status.scheduler.roster)}</p>
+            <p className="text-xs text-slate-400">Connectivity: {scheduleRun(clock.status.scheduler.connectivity)}</p>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">
+            {clock.status.scheduler.lastError
+              ? `Scheduler error: ${clock.status.scheduler.lastError}`
+              : clock.status.scheduler.initializing
+              ? "Scheduler is initializing."
+              : !clock.status.scheduler.initialized
+              ? "Scheduler has not initialized in this server process."
+              : clock.status.scheduler.lastCheckedAt
+              ? `Last checked: ${formatTime(new Date(clock.status.scheduler.lastCheckedAt), clock.status.serverTimeZone)}`
+              : "Scheduler is initialized; waiting for its first schedule check."}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SetupTab({
   sysConfig,
   savingRecipients,
   onSaveRecipients,
+  scheduleWindow,
+  setScheduleWindow,
+  savingSchedule,
+  onSaveSchedule,
 }: {
   sysConfig: SystemConfig | null;
   savingRecipients: boolean;
   onSaveRecipients: (email: EmailRecipientForm) => void;
+  scheduleWindow: ScheduleWindow;
+  setScheduleWindow: (schedule: ScheduleWindow) => void;
+  savingSchedule: boolean;
+  onSaveSchedule: (schedule: ScheduleWindow) => void;
 }) {
   const [email, setEmail] = useState<EmailRecipientForm>({
     rosterTo: "",
@@ -1142,6 +1342,77 @@ function SetupTab({
             {savingRecipients ? "Saving…" : "Save Recipients"}
           </button>
         </div>
+      </Card>
+
+      <Card title="Automatic Job Schedule" icon="⏰">
+        <p className="mb-4 text-sm text-slate-400">
+          Both jobs run at independently randomized times inside this window on the selected days, using server local time. Holiday-calendar dates are skipped.
+        </p>
+        <ServerScheduleClock />
+        <div className="mb-5 grid gap-4 sm:grid-cols-2">
+          <label className="text-sm text-slate-300">
+            Window starts
+            <input
+              type="time"
+              value={scheduleWindow.start}
+              onChange={(event) => setScheduleWindow({ ...scheduleWindow, start: event.target.value })}
+              className="mt-1 block w-full rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-white"
+            />
+          </label>
+          <label className="text-sm text-slate-300">
+            Window ends
+            <input
+              type="time"
+              value={scheduleWindow.end}
+              onChange={(event) => setScheduleWindow({ ...scheduleWindow, end: event.target.value })}
+              className="mt-1 block w-full rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-white"
+            />
+          </label>
+        </div>
+        <fieldset>
+          <legend className="mb-2 text-sm font-medium text-slate-300">Run on</legend>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {SCHEDULE_DAYS.map(({ value, label }) => (
+              <label key={value} className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-sm text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={scheduleWindow.days.includes(value)}
+                  onChange={(event) => {
+                    const days = event.target.checked
+                      ? [...scheduleWindow.days, value].sort((a, b) => a - b)
+                      : scheduleWindow.days.filter((day) => day !== value);
+                    setScheduleWindow({ ...scheduleWindow, days });
+                  }}
+                  className="accent-purple-500"
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <p className="mt-4 text-xs text-amber-200">
+          Changes apply within about one minute without restarting the app. Changing any schedule setting after a job has run can make that job run again today if today is selected and time remains in the new window. Avoid changing settings unless you intend to reschedule/re-run today&apos;s jobs.
+        </p>
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={() => onSaveSchedule(scheduleWindow)}
+            disabled={
+              savingSchedule ||
+              !sysConfig ||
+              scheduleWindow.end < scheduleWindow.start ||
+              scheduleWindow.days.length === 0
+            }
+            className="rounded-lg border border-purple-500 bg-purple-700 px-4 py-2 text-sm font-medium text-white transition-all hover:bg-purple-600 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {savingSchedule ? "Saving…" : "Save Schedule"}
+          </button>
+        </div>
+        {scheduleWindow.end < scheduleWindow.start && (
+          <p className="mt-2 text-sm text-red-300">End time must be the same as or later than the start time.</p>
+        )}
+        {scheduleWindow.days.length === 0 && (
+          <p className="mt-2 text-sm text-red-300">Select at least one day.</p>
+        )}
       </Card>
 
       <Card title="Environment Variables Setup" icon="⚙️">
@@ -1206,20 +1477,8 @@ function SetupTab({
             <EnvVarRow envKey="EXCEL_SHEET_PREFIX" example="Connectivity" desc="Sheet name prefix (e.g. 'Connectivity 2024-01-15')" />
           </EnvSection>
 
-          {/* Schedule */}
-          <EnvSection title="⏰ Schedule (Cron)" color="purple">
-            <EnvVarRow envKey="CRON_ROSTER" example="0 8 * * *" desc="Roster job cron (default: 8:00 AM daily)" />
-            <EnvVarRow envKey="CRON_CONNECTIVITY" example="0 8 * * *" desc="Connectivity job cron (default: 8:00 AM daily)" />
+          <EnvSection title="⚙️ General" color="purple">
             <EnvVarRow envKey="CONFIRM_TIMEOUT_MS" example="1800000" desc="Telegram confirmation timeout in ms (default: 30 mins)" />
-            <div className="mt-4 bg-purple-900/20 border border-purple-500/30 rounded-xl p-4 text-sm">
-              <p className="text-purple-300 font-semibold mb-2">⏰ Cron Format: minute hour day month weekday</p>
-              <div className="grid grid-cols-2 gap-2 text-xs text-slate-400">
-                <code>0 8 * * *</code><span>Every day at 8:00 AM</span>
-                <code>0 8 * * 1-5</code><span>Weekdays at 8:00 AM</span>
-                <code>30 7 * * *</code><span>Every day at 7:30 AM</span>
-                <code>0 9 * * 0</code><span>Sundays at 9:00 AM</span>
-              </div>
-            </div>
           </EnvSection>
         </div>
       </Card>

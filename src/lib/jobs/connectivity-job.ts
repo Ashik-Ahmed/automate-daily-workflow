@@ -17,6 +17,7 @@ import { appendConnectivitySheet } from "@/lib/excel";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { cfg } from "@/lib/config";
 import { captureQadminQueueScreenshot } from "@/lib/qadmin";
+import { isHoliday } from "@/lib/holiday-calendar";
 
 function buildConnectivityEmailHtml(
   checkDate: string,
@@ -88,6 +89,19 @@ export async function runConnectivityJob(
   const jobId = job!.id;
 
   try {
+    const holiday = await isHoliday(today);
+    if (holiday) {
+      await db
+        .update(jobRuns)
+        .set({ status: "holiday", updatedAt: new Date() })
+        .where(eq(jobRuns.id, jobId));
+      await sendNotification(
+        `🏖️ <b>Connectivity Job #${jobId} Skipped</b>\n${today} is ${escapeTelegramHtml(holiday.name)}. No connectivity check or email was generated.`
+      );
+      console.log(`[ConnectivityJob #${jobId}] Skipped: ${holiday.name}`);
+      return;
+    }
+
     // Step 1: SSH into ASA
     await db
       .update(jobRuns)

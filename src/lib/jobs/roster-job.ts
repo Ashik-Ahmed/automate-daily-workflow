@@ -13,7 +13,7 @@ import { rosterEntries, jobRuns } from "@/db/schema";
 import { escapeTelegramHtml, sendConfirmationRequest, sendNotification } from "@/lib/telegram";
 import { sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
-import { isRosterHoliday } from "@/lib/holiday-calendar";
+import { isHoliday } from "@/lib/holiday-calendar";
 
 export interface RosterEntry {
   employeeName: string;
@@ -224,7 +224,7 @@ export async function runRosterJob(
   const jobId = job!.id;
 
   try {
-    const holiday = await isRosterHoliday(today);
+    const holiday = await isHoliday(today);
     if (holiday) {
       await db
         .update(jobRuns)
