@@ -208,6 +208,7 @@ type Tab = "dashboard" | "roster" | "stakeholders" | "history" | "setup";
 export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [jobs, setJobs] = useState<JobRun[]>([]);
+  const [jobsLoadError, setJobsLoadError] = useState<string | null>(null);
   const [sysConfig, setSysConfig] = useState<SystemConfig | null>(null);
   const [toast, setToast] = useState<{ msg: string; type: "ok" | "err" } | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
@@ -225,8 +226,22 @@ export default function Home() {
   };
 
   const fetchJobs = useCallback(async () => {
-    const res = await fetch("/api/jobs/history");
-    if (res.ok) setJobs(await res.json() as JobRun[]);
+    try {
+      const res = await fetch("/api/jobs/history");
+      const data = await res.json() as JobRun[] | { error?: string };
+      if (!res.ok) {
+        throw new Error(
+          !Array.isArray(data) && data.error
+            ? data.error
+            : `Could not load jobs (HTTP ${res.status})`
+        );
+      }
+      if (!Array.isArray(data)) throw new Error("Invalid job history response");
+      setJobs(data);
+      setJobsLoadError(null);
+    } catch (error: unknown) {
+      setJobsLoadError(error instanceof Error ? error.message : String(error));
+    }
   }, []);
 
   const fetchConfig = useCallback(async () => {
@@ -410,6 +425,7 @@ export default function Home() {
         {activeTab === "dashboard" && (
           <DashboardTab
             jobs={jobs}
+            jobsLoadError={jobsLoadError}
             recentJobs={recentJobs}
             sentToday={sentToday}
             sysConfig={sysConfig}
@@ -420,7 +436,9 @@ export default function Home() {
         )}
         {activeTab === "roster" && <RosterTab showToast={showToast} />}
         {activeTab === "stakeholders" && <StakeholdersTab showToast={showToast} />}
-        {activeTab === "history" && <HistoryTab jobs={jobs} onRefresh={fetchJobs} />}
+        {activeTab === "history" && (
+          <HistoryTab jobs={jobs} jobsLoadError={jobsLoadError} onRefresh={fetchJobs} />
+        )}
         {activeTab === "setup" && (
           <SetupTab
             sysConfig={sysConfig}
@@ -445,6 +463,7 @@ export default function Home() {
 
 function DashboardTab({
   jobs,
+  jobsLoadError,
   recentJobs,
   sentToday,
   sysConfig,
@@ -453,6 +472,7 @@ function DashboardTab({
   onRefresh,
 }: {
   jobs: JobRun[];
+  jobsLoadError: string | null;
   recentJobs: JobRun[];
   sentToday: number;
   sysConfig: SystemConfig | null;
@@ -471,10 +491,10 @@ function DashboardTab({
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: "SMTP Accepted Today", value: sentToday, icon: "📧", color: "blue" },
-          { label: "Total SMTP Accepted", value: totalSent, icon: "✅", color: "green" },
-          { label: "Awaiting Confirmation", value: awaitingConfirm, icon: "💬", color: "yellow" },
-          { label: "Errors", value: totalErrors, icon: "🔥", color: "red" },
+          { label: "SMTP Accepted Today", value: jobsLoadError ? "—" : sentToday, icon: "📧", color: "blue" },
+          { label: "Total SMTP Accepted", value: jobsLoadError ? "—" : totalSent, icon: "✅", color: "green" },
+          { label: "Awaiting Confirmation", value: jobsLoadError ? "—" : awaitingConfirm, icon: "💬", color: "yellow" },
+          { label: "Errors", value: jobsLoadError ? "—" : totalErrors, icon: "🔥", color: "red" },
         ].map((stat) => (
           <div
             key={stat.label}
@@ -500,6 +520,13 @@ function DashboardTab({
           </div>
         ))}
       </div>
+      {jobsLoadError && (
+        <div className="rounded-xl border border-red-500/40 bg-red-950/40 p-4 text-sm text-red-200" role="alert">
+          Could not load job data: {jobsLoadError}. If the database reports a missing
+          <code className="mx-1">retry_count</code> column, run <code>npm run db:push</code>
+          against the production database, then restart the app.
+        </div>
+      )}
 
       {/* Action Cards */}
       <div className="grid md:grid-cols-2 gap-6">
@@ -628,7 +655,9 @@ function DashboardTab({
         </div>
         {recentJobs.length === 0 ? (
           <p className="text-slate-500 text-sm text-center py-8">
-            No jobs yet. Trigger one above or wait for the scheduled run.
+            {jobsLoadError
+              ? "Job list is unavailable because the jobs API returned an error."
+              : "No jobs yet. Trigger one above or wait for the scheduled run."}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -1114,7 +1143,15 @@ function StakeholdersTab({ showToast }: { showToast: (msg: string, type: "ok" | 
 
 // ─── History Tab ──────────────────────────────────────────────────────────────
 
-function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void }) {
+function HistoryTab({
+  jobs,
+  jobsLoadError,
+  onRefresh,
+}: {
+  jobs: JobRun[];
+  jobsLoadError: string | null;
+  onRefresh: () => void;
+}) {
   const [filter, setFilter] = useState<string>("all");
 
   const filtered = filter === "all" ? jobs : jobs.filter((j) => j.jobType === filter || j.status === filter);
@@ -1142,6 +1179,14 @@ function HistoryTab({ jobs, onRefresh }: { jobs: JobRun[]; onRefresh: () => void
           🔄 Refresh
         </button>
       </div>
+
+      {jobsLoadError && (
+        <div className="mb-4 rounded-xl border border-red-500/40 bg-red-950/40 p-4 text-sm text-red-200" role="alert">
+          Could not load job history: {jobsLoadError}. If the database reports a missing
+          <code className="mx-1">retry_count</code> column, run <code>npm run db:push</code>
+          against the production database, then restart the app.
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <p className="text-slate-500 text-center py-12">No jobs match this filter.</p>
