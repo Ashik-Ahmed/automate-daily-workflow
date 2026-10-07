@@ -22,3 +22,18 @@ After the schema is set up, start the app normally:
 ```sh
 npm run start
 ```
+
+## Production browser setup
+
+The connectivity ASA preview and QAdmin email screenshot use Playwright Chromium.
+After installing the npm dependencies, install the browser as the same Linux
+user that runs the application:
+
+```sh
+npm run install:browser
+```
+
+Run this again when upgrading Playwright. On Linux hosts that report missing
+shared libraries, install the browser's OS dependencies with
+`npx playwright install --with-deps chromium` (this may require administrator
+privileges), then restart the application.

@@ -1,7 +1,7 @@
-import { chromium } from "playwright";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { cfg } from "./config";
+import { launchChromium } from "./playwright-browser";
 
 export interface QadminQueueStatus {
   operator: string;
@@ -21,7 +21,7 @@ export async function captureQadminQueueScreenshot(): Promise<QadminCaptureResul
   const outputPath = path.resolve(process.cwd(), "data", "qadmin.png");
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchChromium();
   let stage = "open portal login page";
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });

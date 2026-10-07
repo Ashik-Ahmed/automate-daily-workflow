@@ -1,4 +1,4 @@
-import { chromium } from "playwright";
+import { launchChromium } from "./playwright-browser";
 
 export function getReportableAsaOutput(rawOutput: string): string {
   const lines = rawOutput.split(/\r?\n/);
@@ -11,7 +11,7 @@ export async function renderAsaOutputImage(rawOutput: string): Promise<Buffer> {
   const lines = output.split("\n");
   const maxLineLength = Math.max(1, ...lines.map((line) => line.length));
   const width = Math.max(720, Math.min(2400, maxLineLength * 9 + 24));
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchChromium();
 
   try {
     const page = await browser.newPage({
