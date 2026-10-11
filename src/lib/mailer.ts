@@ -46,6 +46,15 @@ export interface EmailDeliveryResult {
   response: string;
 }
 
+export class AmbiguousEmailDeliveryError extends Error {
+  readonly retryable = false;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "AmbiguousEmailDeliveryError";
+  }
+}
+
 function formatRecipient(recipient: unknown): string {
   if (typeof recipient === "string") return recipient;
   if (
@@ -122,23 +131,35 @@ export async function sendEmail(opts: SendMailOptions): Promise<EmailDeliveryRes
 
   const t = getTransporter();
   const signature = addSenderSignature(opts.html);
-  const info = await t.sendMail({
-    from: cfg.smtp.from,
-    to: opts.to.join(", "),
-    cc: opts.cc?.join(", "),
-    subject: opts.subject,
-    html: signature.html,
-    attachments: [
-      ...(opts.attachments ?? []),
-      ...(signature.logoAttachment ? [signature.logoAttachment] : []),
-    ],
-  });
+  let info: nodemailer.SentMessageInfo;
+  try {
+    info = await t.sendMail({
+      from: cfg.smtp.from,
+      to: opts.to.join(", "),
+      cc: opts.cc?.join(", "),
+      subject: opts.subject,
+      html: signature.html,
+      attachments: [
+        ...(opts.attachments ?? []),
+        ...(signature.logoAttachment ? [signature.logoAttachment] : []),
+      ],
+    });
+  } catch (error: unknown) {
+    const smtpError = error as { command?: string; code?: string; message?: string };
+    if (smtpError.command?.toUpperCase() === "DATA") {
+      throw new AmbiguousEmailDeliveryError(
+        `SMTP delivery outcome is unknown after DATA: ${smtpError.message ?? String(error)}`,
+        { cause: error }
+      );
+    }
+    throw error;
+  }
 
   const result = {
     messageId: info.messageId,
-    accepted: info.accepted.map(formatRecipient),
-    rejected: info.rejected.map(formatRecipient),
-    response: info.response,
+    accepted: (info.accepted ?? []).map(formatRecipient),
+    rejected: (info.rejected ?? []).map(formatRecipient),
+    response: info.response ?? "",
   };
   if (result.accepted.length === 0) {
     throw new Error(`SMTP accepted no recipients. Rejected: ${result.rejected.join(", ") || "none reported"}`);

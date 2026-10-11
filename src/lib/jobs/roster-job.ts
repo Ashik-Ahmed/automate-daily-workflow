@@ -18,13 +18,15 @@ import {
   sendConfirmationRequest,
   sendNotification,
 } from "@/lib/telegram";
-import { sendEmail } from "@/lib/mailer";
+import { AmbiguousEmailDeliveryError, sendEmail } from "@/lib/mailer";
 import { getEmailRecipients } from "@/lib/email-recipients";
 import { isHoliday } from "@/lib/holiday-calendar";
 import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
 import {
   claimJobDelivery,
+  MAX_JOB_RETRIES,
   createJobRetryBudget,
+  retryDelayMs,
   retryImmediatelyUntilSuccessful,
 } from "@/lib/job-retry";
 
@@ -224,31 +226,51 @@ function buildTelegramPreview(entries: RosterEntry[], date: string): string {
 }
 
 export async function runRosterJob(
-  triggerType: "scheduled" | "manual" = "scheduled"
+  triggerType: "scheduled" | "manual" = "scheduled",
+  scheduledDate?: string,
+  existingJobId?: number
 ): Promise<void> {
-  const today = getAppDateString();
+  let today = getAppDateString();
   console.log(`[RosterJob] Starting for ${today}`);
 
-  // Create job record
-  const startedAt = new Date();
-  const [job] = await db
-    .insert(jobRuns)
-    .values({
-      jobType: "roster",
-      status: "pending",
-      triggerType,
-      createdAt: startedAt,
-      updatedAt: startedAt,
-    })
-    .returning();
+  let job;
+  if (existingJobId) {
+    [job] = await db.select().from(jobRuns).where(eq(jobRuns.id, existingJobId)).limit(1);
+    if (!job || job.jobType !== "roster" || ["sent", "rejected", "holiday", "delivery_unknown"].includes(job.status)) return;
+    today = getAppDateString(job.createdAt ?? new Date());
+    triggerType = job.triggerType as "scheduled" | "manual";
+  } else {
+    const startedAt = new Date();
+    [job] = await db
+      .insert(jobRuns)
+      .values({
+        jobType: "roster",
+        status: "pending",
+        triggerType,
+        ...(triggerType === "scheduled" ? { scheduledDate: scheduledDate ?? today } : {}),
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      })
+      .onConflictDoNothing()
+      .returning();
+  }
+
+  if (!job) {
+    console.log(`[RosterJob] Scheduled run already exists for ${scheduledDate ?? today}`);
+    return;
+  }
 
   const jobId = job!.id;
-  const retryBudget = createJobRetryBudget();
+  const retryBudget = createJobRetryBudget(job.retryCount);
   let emailAccepted = false;
   let retryNoticeSent = false;
+  let workflowStep = "prepare";
   markJobRunnerActive(jobId);
 
   try {
+    if (existingJobId) {
+      await db.update(jobRuns).set({ status: "pending", error: null, nextAttemptAt: null, leaseExpiresAt: null, updatedAt: new Date() }).where(eq(jobRuns.id, jobId));
+    }
     const holiday = await isHoliday(today);
     if (holiday) {
       await db
@@ -262,6 +284,7 @@ export async function runRosterJob(
       return;
     }
 
+    workflowStep = "roster_data";
     // Fetch today's roster
     let entries = await db
       .select()
@@ -272,7 +295,7 @@ export async function runRosterJob(
     const legacyHolidayEntry = entries.find(
       (entry) =>
         entry.shift.toLowerCase() === "holiday" ||
-        /^(holiday|durga puja)$/i.test(entry.employeeName.trim())
+        /^holiday$/i.test(entry.employeeName.trim())
     );
     if (legacyHolidayEntry) {
       await db
@@ -287,14 +310,7 @@ export async function runRosterJob(
     }
 
     if (entries.length === 0) {
-      await sendNotification(
-        `⚠️ <b>Roster Job #${jobId}</b>: No roster entries found for ${today}. Please upload the roster first.`
-      );
-      await db
-        .update(jobRuns)
-        .set({ status: "error", error: "No roster entries for today", updatedAt: new Date() })
-        .where(eq(jobRuns.id, jobId));
-      return;
+      throw new Error(`No roster entries for ${today}; upload the roster and the job will retry.`);
     }
 
     let rosterList: RosterEntry[] = entries.map((e) => ({
@@ -307,6 +323,8 @@ export async function runRosterJob(
       .update(jobRuns)
       .set({
         status: "waiting_confirm",
+        workflowStep: "approval",
+        approvalExpiresAt: new Date(Date.now() + 600_000),
         previewData: rosterList,
         updatedAt: new Date(),
       })
@@ -314,6 +332,7 @@ export async function runRosterJob(
 
     // Send Telegram preview
     const previewText = buildTelegramPreview(rosterList, today);
+    workflowStep = "approval";
     const { approved, adjustment } = await sendConfirmationRequest(jobId, previewText);
 
     if (!approved) {
@@ -324,6 +343,9 @@ export async function runRosterJob(
       console.log(`[RosterJob #${jobId}] Rejected by manager`);
       return;
     }
+
+    workflowStep = "delivery";
+    await db.update(jobRuns).set({ status: "confirmed", workflowStep, adjustments: adjustment ?? null, updatedAt: new Date() }).where(eq(jobRuns.id, jobId));
 
     // Apply adjustments if any
     if (adjustment) {
@@ -359,14 +381,17 @@ export async function runRosterJob(
         });
         return { delivery: result, emailRecipients: recipients };
       },
-      async (attempt, error) => {
+      async (attempt, error, retryAt) => {
         const message = error instanceof Error ? error.message : String(error);
-        const willRetry = retryBudget.retriesRemaining > 0;
+        const willRetry = !(error instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
           .set({
             error: message,
-            status: willRetry ? "retrying" : "error",
+            status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+            ...(error instanceof AmbiguousEmailDeliveryError ? { deliveryOutcome: "ambiguous" } : {}),
+            nextAttemptAt: retryAt ?? null,
+            leaseExpiresAt: retryAt ? new Date(retryAt.getTime() + 120_000) : null,
             ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
             updatedAt: new Date(),
           })
@@ -374,8 +399,10 @@ export async function runRosterJob(
         if (!retryNoticeSent) {
           retryNoticeSent = true;
           const retriesRemaining = retryBudget.retriesRemaining;
-          const retryStatus = willRetry
-            ? `Retrying immediately (${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
+          const retryStatus = error instanceof AmbiguousEmailDeliveryError
+            ? "SMTP outcome is unknown; stopped to avoid a possible duplicate email."
+            : willRetry
+            ? `Retrying after backoff (${Math.max(1, Math.ceil((retryAt!.getTime() - Date.now()) / 1000))} seconds; ${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
             : "No retries remain; the job will be marked failed.";
           await sendNotification(
             `⚠️ <b>Roster Job #${jobId}</b>: Email attempt ${attempt} failed. ${retryStatus}\n<code>${escapeTelegramHtml(message)}</code>`
@@ -393,7 +420,7 @@ export async function runRosterJob(
       async () => {
         await db
           .update(jobRuns)
-          .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+          .set({ status: "sent", deliveryOutcome: "accepted", nextAttemptAt: null, leaseExpiresAt: null, emailSentAt, error: null, updatedAt: emailSentAt })
           .where(eq(jobRuns.id, jobId));
       },
       async (attempt, error) => {
@@ -421,13 +448,26 @@ export async function runRosterJob(
       return;
     }
     console.error(`[RosterJob #${jobId}] Error:`, msg);
+    const willRetry = !(err instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
+    const retryAt = willRetry ? new Date(Date.now() + retryDelayMs(job.retryCount + 1)) : null;
+    const [latestJob] = await db.select({ retryCount: jobRuns.retryCount }).from(jobRuns).where(eq(jobRuns.id, jobId)).limit(1);
+    const retriesUsed = latestJob?.retryCount ?? job.retryCount;
     await db
       .update(jobRuns)
-      .set({ status: "error", error: msg, updatedAt: new Date() })
+      .set({
+        status: err instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+        workflowStep,
+        deliveryOutcome: err instanceof AmbiguousEmailDeliveryError ? "ambiguous" : null,
+        retryCount: willRetry ? retriesUsed + 1 : retriesUsed,
+        nextAttemptAt: retryAt,
+        leaseExpiresAt: retryAt && workflowStep === "delivery" ? new Date(retryAt.getTime() + 120_000) : null,
+        error: msg,
+        updatedAt: new Date(),
+      })
       .where(eq(jobRuns.id, jobId));
-    await sendNotification(
-      `❌ <b>Roster Job #${jobId} Failed</b>\n<code>${msg}</code>`
-    );
+    await sendNotification(willRetry
+      ? `⚠️ <b>Roster Job #${jobId}</b>: ${workflowStep} failed. Retry scheduled for ${retryAt!.toISOString()} (attempt ${retriesUsed + 2} of ${MAX_JOB_RETRIES + 1}).\n<code>${escapeTelegramHtml(msg)}</code>`
+      : `❌ <b>Roster Job #${jobId} Failed</b>\n<code>${escapeTelegramHtml(msg)}</code>`);
   } finally {
     markJobRunnerInactive(jobId);
   }
@@ -471,14 +511,17 @@ export async function resumeApprovedRosterJob(jobRunId: number): Promise<void> {
         });
         return { delivery: result, emailRecipients: recipients };
       },
-      async (_attempt, error) => {
+      async (_attempt, error, retryAt) => {
         const message = error instanceof Error ? error.message : String(error);
-        const willRetry = retryBudget.retriesRemaining > 0;
+        const willRetry = !(error instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
           .set({
             error: message,
-            status: willRetry ? "retrying" : "error",
+            status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+            ...(error instanceof AmbiguousEmailDeliveryError ? { deliveryOutcome: "ambiguous" } : {}),
+            nextAttemptAt: retryAt ?? null,
+            leaseExpiresAt: retryAt ? new Date(retryAt.getTime() + 120_000) : null,
             ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
             updatedAt: new Date(),
           })
@@ -489,7 +532,7 @@ export async function resumeApprovedRosterJob(jobRunId: number): Promise<void> {
     const emailSentAt = new Date();
     await db
       .update(jobRuns)
-      .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+      .set({ status: "sent", deliveryOutcome: "accepted", nextAttemptAt: null, leaseExpiresAt: null, emailSentAt, error: null, updatedAt: emailSentAt })
       .where(eq(jobRuns.id, jobRunId));
     await sendNotification(
       `✅ <b>Roster Email Accepted by SMTP</b>\n` +
@@ -507,7 +550,7 @@ export async function resumeApprovedRosterJob(jobRunId: number): Promise<void> {
       const message = error instanceof Error ? error.message : String(error);
       await db
         .update(jobRuns)
-        .set({ status: "error", error: message, updatedAt: new Date() })
+        .set({ status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : "error", deliveryOutcome: error instanceof AmbiguousEmailDeliveryError ? "ambiguous" : null, error: message, updatedAt: new Date() })
         .where(eq(jobRuns.id, jobRunId));
       await sendNotification(
         `❌ <b>Resumed Roster Job #${jobRunId} Failed</b>\n<code>${escapeTelegramHtml(message)}</code>`

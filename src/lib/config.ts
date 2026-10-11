@@ -1,5 +1,15 @@
 // Central config — reads all env vars and provides typed helpers
 
+const configuredExcelPath =
+  process.env.CONNECTIVITY_EXCEL_PATH ??
+  "./data/Daily Node Status (DC) (2026).xlsx";
+const normalizedExcelPath = configuredExcelPath
+  .trim()
+  // Quotes used for shell/.env configuration are delimiters, not filename characters.
+  .replace(/^(['"])(.*)\1$/, "$2")
+  // Also accept paths accidentally entered with quotes around only the filename.
+  .replace(/([\\/])(['"])([^\\/'"]+\.xlsx)\2$/i, "$1$3");
+
 export const cfg = {
   // Email (SMTP)
   smtp: {
@@ -56,7 +66,7 @@ export const cfg = {
 
   // Excel attachment
   excel: {
-    filePath: process.env.CONNECTIVITY_EXCEL_PATH ?? "./data/connectivity.xlsx",
+    filePath: normalizedExcelPath,
   },
 
   // Telegram confirmations automatically approve after 10 minutes

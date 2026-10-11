@@ -45,20 +45,27 @@ ASA output is sent to Telegram as a sequence of compact JPEG pages, followed by
 a separate approval message. This keeps image uploads small while retaining
 the complete report; the full ASA output is also stored in connectivity results.
 
-## Approved job delivery retries
+## Job retries and delivery outcomes
 
-After a roster or connectivity job is approved in Telegram, failures while
-preparing or sending its email are retried immediately without asking for
-approval again, with at most three retries (four attempts total) per job.
-Connectivity QAdmin capture happens before the Telegram confirmation prompt
-and shares that job's retry budget with email delivery. The job history retains
-the most recent retry error while work is pending. Keep the app process running
-while a retry is in progress. Failures before approval other than QAdmin
-capture (for example, missing roster data) are not auto-retried.
-SMTP connections time out after 30 seconds and inactive sends time out after
-60 seconds, allowing a stalled send to enter the retry flow. If the app restarts
-while a confirmation is pending, clicking Approve after the app starts again
-resumes delivery from the job's saved preview/ASA data. If a restart interrupts
-delivery after approval and removes the confirmation buttons, trigger a new job
-from the dashboard. Email delivery is claimed atomically in the database so an
-original runner and a resumed runner cannot both send the same job.
+Preparation, QAdmin, and SMTP failures use a bounded retry policy with exponential
+backoff and jitter (up to three retries). The retry count, next attempt time,
+workflow step, and delivery outcome are stored in `job_runs`. Approved
+preparation and delivery retries are recovered by the scheduler after an
+application restart. Telegram approval still expires after ten minutes and
+auto-approves on timeout; the persisted expiration is honored after a restart
+without sending another preview.
+Connectivity Excel updates are performed once before the SMTP retry loop; the
+workbook replaces the sheet for a date, making a repeated date update
+idempotent.
+
+If SMTP fails while processing the DATA command, or the app stops during an
+in-flight send, the server may have accepted the message even though the
+application did not receive confirmation. Such a job is marked
+`delivery_unknown` and is not automatically retried, to reduce the chance of
+sending a duplicate. SMTP acceptance still does not prove inbox delivery.
+
+The database schema now has workflow, retry, lease, and scheduled-run fields.
+Run `npm run db:push` against the intended database before restarting after
+upgrading. A unique index ensures at most one scheduled run per job
+type and Dhaka calendar date, including when multiple app instances dispatch
+the same schedule.

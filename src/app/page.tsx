@@ -106,6 +106,7 @@ const STATUS_COLORS: Record<string, string> = {
   confirmed: "bg-teal-500/20 text-teal-300 border-teal-500/30",
   sending: "bg-cyan-500/20 text-cyan-300 border-cyan-500/30",
   retrying: "bg-amber-500/20 text-amber-300 border-amber-500/30",
+  delivery_unknown: "bg-orange-500/20 text-orange-200 border-orange-500/40",
   sent: "bg-green-500/20 text-green-300 border-green-500/30",
   holiday: "bg-slate-500/20 text-slate-300 border-slate-500/30",
   rejected: "bg-orange-500/20 text-orange-300 border-orange-500/30",
@@ -119,6 +120,7 @@ const STATUS_ICONS: Record<string, string> = {
   confirmed: "✅",
   sending: "↗",
   retrying: "↻",
+  delivery_unknown: "⚠️",
   sent: "📧",
   holiday: "🏖️",
   rejected: "❌",
@@ -232,7 +234,19 @@ export default function Home() {
   const fetchJobs = useCallback(async () => {
     try {
       const res = await fetch("/api/jobs/history");
-      const data = await res.json() as JobRun[] | { error?: string };
+      const responseText = await res.text();
+      let data: JobRun[] | { error?: string };
+      try {
+        data = JSON.parse(responseText) as JobRun[] | { error?: string };
+      } catch {
+        const contentType = res.headers.get("content-type") ?? "unknown content type";
+        throw new Error(
+          `Job history endpoint returned HTTP ${res.status} (${contentType}); expected JSON. ` +
+            (res.status === 404
+              ? "Restart the development server and confirm it is running from this project directory."
+              : "Check the development server logs for the endpoint error.")
+        );
+      }
       if (!res.ok) {
         throw new Error(
           !Array.isArray(data) && data.error
@@ -485,7 +499,7 @@ function DashboardTab({
   onRefresh: () => void;
 }) {
   const totalSent = jobs.filter((j) => j.status === "sent").length;
-  const totalErrors = jobs.filter((j) => j.status === "error").length;
+  const totalErrors = jobs.filter((j) => j.status === "error" || j.status === "delivery_unknown").length;
   const awaitingConfirm = jobs.filter(
     (j) => j.status === "waiting_confirm" || j.status === "waiting_adjustment"
   ).length;
@@ -526,9 +540,7 @@ function DashboardTab({
       </div>
       {jobsLoadError && (
         <div className="rounded-xl border border-red-500/40 bg-red-950/40 p-4 text-sm text-red-200" role="alert">
-          Could not load job data: {jobsLoadError}. If the database reports a missing
-          <code className="mx-1">retry_count</code> column, run <code>npm run db:push</code>
-          against the production database, then restart the app.
+          Could not load job data: {jobsLoadError}
         </div>
       )}
 
@@ -1163,7 +1175,7 @@ function HistoryTab({
   return (
     <Card title="Job History" icon="📜">
       <div className="flex flex-wrap gap-2 mb-5">
-        {["all", "roster", "connectivity", "sent", "retrying", "holiday", "error", "rejected"].map((f) => (
+        {["all", "roster", "connectivity", "sent", "retrying", "delivery_unknown", "holiday", "error", "rejected"].map((f) => (
           <button
             key={f}
             onClick={() => setFilter(f)}
@@ -1186,9 +1198,7 @@ function HistoryTab({
 
       {jobsLoadError && (
         <div className="mb-4 rounded-xl border border-red-500/40 bg-red-950/40 p-4 text-sm text-red-200" role="alert">
-          Could not load job history: {jobsLoadError}. If the database reports a missing
-          <code className="mx-1">retry_count</code> column, run <code>npm run db:push</code>
-          against the production database, then restart the app.
+          Could not load job history: {jobsLoadError}
         </div>
       )}
 
@@ -1552,7 +1562,7 @@ function SetupTab({
 
           {/* Excel */}
           <EnvSection title="📊 Excel File" color="green">
-            <EnvVarRow envKey="CONNECTIVITY_EXCEL_PATH" example="./data/connectivity.xlsx" desc="Path to Excel file (will be created if not exists)" />
+            <EnvVarRow envKey="CONNECTIVITY_EXCEL_PATH" example="./data/Daily Node Status (DC) (2026).xlsx" desc="Path to Excel file (will be created if not exists)" />
           </EnvSection>
 
         </div>

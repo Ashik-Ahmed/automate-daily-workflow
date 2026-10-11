@@ -7,6 +7,7 @@
  */
 
 import { format, parseISO } from "date-fns";
+import * as path from "node:path";
 import { db } from "@/db";
 import { jobRuns, connectivityResults } from "@/db/schema";
 import { eq, sql } from "drizzle-orm";
@@ -18,7 +19,7 @@ import {
   sendConfirmationRequest,
   sendNotification,
 } from "@/lib/telegram";
-import { sendEmail } from "@/lib/mailer";
+import { AmbiguousEmailDeliveryError, sendEmail } from "@/lib/mailer";
 import { fetchAsaConnectivity, parseIsakmpOutput } from "@/lib/ssh-asa";
 import { appendConnectivitySheet } from "@/lib/excel";
 import { getEmailRecipients } from "@/lib/email-recipients";
@@ -29,7 +30,9 @@ import { renderAsaOutputImage } from "@/lib/asa-output-image";
 import { formatAppDateLabel, getAppDateString } from "@/lib/app-time";
 import {
   claimJobDelivery,
+  MAX_JOB_RETRIES,
   createJobRetryBudget,
+  retryDelayMs,
   retryImmediatelyUntilSuccessful,
 } from "@/lib/job-retry";
 
@@ -87,30 +90,51 @@ function buildTelegramPreview(
 }
 
 export async function runConnectivityJob(
-  triggerType: "scheduled" | "manual" = "scheduled"
+  triggerType: "scheduled" | "manual" = "scheduled",
+  scheduledDate?: string,
+  existingJobId?: number
 ): Promise<void> {
-  const today = getAppDateString();
+  let today = getAppDateString();
   console.log(`[ConnectivityJob] Starting for ${today}`);
 
-  const startedAt = new Date();
-  const [job] = await db
-    .insert(jobRuns)
-    .values({
-      jobType: "connectivity",
-      status: "pending",
-      triggerType,
-      createdAt: startedAt,
-      updatedAt: startedAt,
-    })
-    .returning();
+  let job;
+  if (existingJobId) {
+    [job] = await db.select().from(jobRuns).where(eq(jobRuns.id, existingJobId)).limit(1);
+    if (!job || job.jobType !== "connectivity" || ["sent", "rejected", "holiday", "delivery_unknown"].includes(job.status)) return;
+    today = getAppDateString(job.createdAt ?? new Date());
+    triggerType = job.triggerType as "scheduled" | "manual";
+  } else {
+    const startedAt = new Date();
+    [job] = await db
+      .insert(jobRuns)
+      .values({
+        jobType: "connectivity",
+        status: "pending",
+        triggerType,
+        ...(triggerType === "scheduled" ? { scheduledDate: scheduledDate ?? today } : {}),
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      })
+      .onConflictDoNothing()
+      .returning();
+  }
+
+  if (!job) {
+    console.log(`[ConnectivityJob] Scheduled run already exists for ${scheduledDate ?? today}`);
+    return;
+  }
 
   const jobId = job!.id;
-  const retryBudget = createJobRetryBudget();
+  const retryBudget = createJobRetryBudget(job.retryCount);
   let emailAccepted = false;
   let deliveryRetryNoticeSent = false;
+  let workflowStep = "prepare";
   markJobRunnerActive(jobId);
 
   try {
+    if (existingJobId) {
+      await db.update(jobRuns).set({ status: "pending", error: null, nextAttemptAt: null, leaseExpiresAt: null, updatedAt: new Date() }).where(eq(jobRuns.id, jobId));
+    }
     const holiday = await isHoliday(today);
     if (holiday) {
       await db
@@ -130,6 +154,7 @@ export async function runConnectivityJob(
       .set({ status: "pending", updatedAt: new Date() })
       .where(eq(jobRuns.id, jobId));
 
+    workflowStep = "asa_capture";
     const asaResult = await fetchAsaConnectivity();
 
     if (!asaResult.success) {
@@ -148,6 +173,9 @@ export async function runConnectivityJob(
       rawOutput: asaResult.output,
       parsedData: parsed,
       jobRunId: jobId,
+    }).onConflictDoUpdate({
+      target: connectivityResults.jobRunId,
+      set: { checkDate: today, rawOutput: asaResult.output, parsedData: parsed },
     });
 
     await db
@@ -159,18 +187,23 @@ export async function runConnectivityJob(
       })
       .where(eq(jobRuns.id, jobId));
 
+    workflowStep = "qadmin_capture";
+    await db.update(jobRuns).set({ workflowStep, updatedAt: new Date() }).where(eq(jobRuns.id, jobId));
     const qadminCapture = await retryImmediatelyUntilSuccessful(
       `ConnectivityJob #${jobId} QAdmin capture`,
       retryBudget,
       () => captureQadminQueueScreenshot(),
-      async (_attempt, error) => {
+      async (_attempt, error, retryAt) => {
         const message = error instanceof Error ? error.message : String(error);
-        const willRetry = retryBudget.retriesRemaining > 0;
+        const willRetry = !(error instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
           .set({
             error: message,
-            status: willRetry ? "retrying" : "error",
+            status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+            ...(error instanceof AmbiguousEmailDeliveryError ? { deliveryOutcome: "ambiguous" } : {}),
+            nextAttemptAt: retryAt ?? null,
+            leaseExpiresAt: retryAt ? new Date(retryAt.getTime() + 120_000) : null,
             ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
             updatedAt: new Date(),
           })
@@ -179,7 +212,7 @@ export async function runConnectivityJob(
     );
     await db
       .update(jobRuns)
-      .set({ status: "waiting_confirm", error: null, updatedAt: new Date() })
+      .set({ status: "waiting_confirm", workflowStep: "approval", approvalExpiresAt: new Date(Date.now() + 600_000), error: null, updatedAt: new Date() })
       .where(eq(jobRuns.id, jobId));
     if (!asaResult.success) {
       await sendNotification(
@@ -193,6 +226,7 @@ export async function runConnectivityJob(
     // Step 2: Telegram preview
     const previewText = buildTelegramPreview(today, upCount, downCount);
     const asaOutputImage = await renderAsaOutputImage(asaResult.output);
+    workflowStep = "approval";
     const { approved, adjustment } = await sendConfirmationRequest(
       jobId,
       previewText,
@@ -208,6 +242,9 @@ export async function runConnectivityJob(
       return;
     }
 
+    workflowStep = "delivery";
+    await db.update(jobRuns).set({ status: "confirmed", workflowStep, adjustments: adjustment ?? null, updatedAt: new Date() }).where(eq(jobRuns.id, jobId));
+
     const html = buildConnectivityEmailHtml(today, adjustment);
     const dateDisplay = format(parseISO(today), "do MMMM yyyy");
     const subject = `Daily connectivity status check dated on the ${dateDisplay}`;
@@ -215,22 +252,21 @@ export async function runConnectivityJob(
       console.log(`[ConnectivityJob #${jobId}] Another runner already claimed delivery`);
       return;
     }
+    let excelPath: string | undefined;
+    try {
+      excelPath = await appendConnectivitySheet(asaResult.output, today);
+      console.log(`[ConnectivityJob #${jobId}] Excel updated: ${excelPath}`);
+    } catch (excelErr: unknown) {
+      const message = excelErr instanceof Error ? excelErr.message : String(excelErr);
+      console.warn(`[ConnectivityJob #${jobId}] Excel error:`, message);
+      await sendNotification(
+        `⚠️ <b>Job #${jobId}</b>: Excel update failed: <code>${escapeTelegramHtml(message)}</code>. Sending email without attachment.`
+      );
+    }
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `ConnectivityJob #${jobId}`,
       retryBudget,
       async () => {
-        let excelPath: string | undefined;
-        try {
-          excelPath = await appendConnectivitySheet(asaResult.output, today);
-          console.log(`[ConnectivityJob #${jobId}] Excel updated: ${excelPath}`);
-        } catch (excelErr: unknown) {
-          const message = excelErr instanceof Error ? excelErr.message : String(excelErr);
-          console.warn(`[ConnectivityJob #${jobId}] Excel error:`, message);
-          await sendNotification(
-            `⚠️ <b>Job #${jobId}</b>: Excel update failed: <code>${escapeTelegramHtml(message)}</code>. Sending email without attachment.`
-          );
-        }
-
         const recipients = await getEmailRecipients();
         const result = await sendEmail({
           to: recipients.connectivityTo,
@@ -238,7 +274,7 @@ export async function runConnectivityJob(
           subject,
           html,
           attachments: [
-            ...(excelPath ? [{ filename: `Connectivity_${today}.xlsx`, path: excelPath }] : []),
+            ...(excelPath ? [{ filename: path.basename(excelPath), path: excelPath }] : []),
             {
               filename: "qadmin.png",
               path: qadminCapture.screenshotPath,
@@ -249,14 +285,17 @@ export async function runConnectivityJob(
         });
         return { delivery: result, emailRecipients: recipients };
       },
-      async (attempt, error) => {
+      async (attempt, error, retryAt) => {
         const message = error instanceof Error ? error.message : String(error);
-        const willRetry = retryBudget.retriesRemaining > 0;
+        const willRetry = !(error instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
           .set({
             error: message,
-            status: willRetry ? "retrying" : "error",
+            status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+            ...(error instanceof AmbiguousEmailDeliveryError ? { deliveryOutcome: "ambiguous" } : {}),
+            nextAttemptAt: retryAt ?? null,
+            leaseExpiresAt: retryAt ? new Date(retryAt.getTime() + 120_000) : null,
             ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
             updatedAt: new Date(),
           })
@@ -264,8 +303,10 @@ export async function runConnectivityJob(
         if (!deliveryRetryNoticeSent) {
           deliveryRetryNoticeSent = true;
           const retriesRemaining = retryBudget.retriesRemaining;
-          const retryStatus = willRetry
-            ? `Retrying immediately (${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
+          const retryStatus = error instanceof AmbiguousEmailDeliveryError
+            ? "SMTP outcome is unknown; stopped to avoid a possible duplicate email."
+            : willRetry
+            ? `Retrying after backoff (${Math.max(1, Math.ceil((retryAt!.getTime() - Date.now()) / 1000))} seconds; ${retriesRemaining} ${retriesRemaining === 1 ? "retry" : "retries"} remaining).`
             : "No retries remain; the job will be marked failed.";
           await sendNotification(
             `⚠️ <b>Connectivity Job #${jobId}</b>: Delivery attempt ${attempt} failed. ${retryStatus}\n<code>${escapeTelegramHtml(message)}</code>`
@@ -283,7 +324,7 @@ export async function runConnectivityJob(
       async () => {
         await db
           .update(jobRuns)
-          .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+          .set({ status: "sent", deliveryOutcome: "accepted", nextAttemptAt: null, leaseExpiresAt: null, emailSentAt, error: null, updatedAt: emailSentAt })
           .where(eq(jobRuns.id, jobId));
       },
       async (attempt, error) => {
@@ -315,9 +356,13 @@ export async function runConnectivityJob(
       return;
     }
     console.error(`[ConnectivityJob #${jobId}] Error:`, msg);
+    const willRetry = !(err instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
+    const retryAt = willRetry ? new Date(Date.now() + retryDelayMs(job.retryCount + 1)) : null;
+    const [latestJob] = await db.select({ retryCount: jobRuns.retryCount }).from(jobRuns).where(eq(jobRuns.id, jobId)).limit(1);
+    const retriesUsed = latestJob?.retryCount ?? job.retryCount;
     await db
       .update(jobRuns)
-      .set({ status: "error", error: msg, updatedAt: new Date() })
+      .set({ status: err instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error", workflowStep, deliveryOutcome: err instanceof AmbiguousEmailDeliveryError ? "ambiguous" : null, retryCount: willRetry ? retriesUsed + 1 : retriesUsed, nextAttemptAt: retryAt, error: msg, updatedAt: new Date() })
       .where(eq(jobRuns.id, jobId));
     await sendNotification(
       `❌ <b>Connectivity Job #${jobId} Failed</b>\n<code>${msg}</code>`
@@ -366,19 +411,18 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
     const dateDisplay = format(parseISO(today), "do MMMM yyyy");
     const subject = `Daily connectivity status check dated on the ${dateDisplay}`;
     const retryBudget = createJobRetryBudget(job.retryCount);
+    let excelPath: string | undefined;
+    try {
+      excelPath = await appendConnectivitySheet(rawOutput, today);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[ConnectivityJob #${jobRunId}] Excel error during resume:`, message);
+    }
     const { delivery, emailRecipients } = await retryImmediatelyUntilSuccessful(
       `ConnectivityJob #${jobRunId} resumed`,
       retryBudget,
       async () => {
         const qadminCapture = await captureQadminQueueScreenshot();
-        let excelPath: string | undefined;
-        try {
-          excelPath = await appendConnectivitySheet(rawOutput, today);
-        } catch (error: unknown) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn(`[ConnectivityJob #${jobRunId}] Excel error during resume:`, message);
-        }
-
         const recipients = await getEmailRecipients();
         const result = await sendEmail({
           to: recipients.connectivityTo,
@@ -386,7 +430,7 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
           subject,
           html,
           attachments: [
-            ...(excelPath ? [{ filename: `Connectivity_${today}.xlsx`, path: excelPath }] : []),
+            ...(excelPath ? [{ filename: path.basename(excelPath), path: excelPath }] : []),
             {
               filename: "qadmin.png",
               path: qadminCapture.screenshotPath,
@@ -397,14 +441,17 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
         });
         return { delivery: result, emailRecipients: recipients };
       },
-      async (_attempt, error) => {
+      async (_attempt, error, retryAt) => {
         const message = error instanceof Error ? error.message : String(error);
-        const willRetry = retryBudget.retriesRemaining > 0;
+        const willRetry = !(error instanceof AmbiguousEmailDeliveryError) && retryBudget.retriesRemaining > 0;
         await db
           .update(jobRuns)
           .set({
             error: message,
-            status: willRetry ? "retrying" : "error",
+            status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : willRetry ? "retrying" : "error",
+            ...(error instanceof AmbiguousEmailDeliveryError ? { deliveryOutcome: "ambiguous" } : {}),
+            nextAttemptAt: retryAt ?? null,
+            leaseExpiresAt: retryAt ? new Date(retryAt.getTime() + 120_000) : null,
             ...(willRetry ? { retryCount: sql`${jobRuns.retryCount} + 1` } : {}),
             updatedAt: new Date(),
           })
@@ -415,7 +462,7 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
     const emailSentAt = new Date();
     await db
       .update(jobRuns)
-      .set({ status: "sent", emailSentAt, error: null, updatedAt: emailSentAt })
+      .set({ status: "sent", deliveryOutcome: "accepted", nextAttemptAt: null, leaseExpiresAt: null, emailSentAt, error: null, updatedAt: emailSentAt })
       .where(eq(jobRuns.id, jobRunId));
     await sendNotification(
       `✅ <b>Connectivity Email Accepted by SMTP</b>\n` +
@@ -434,7 +481,7 @@ export async function resumeApprovedConnectivityJob(jobRunId: number): Promise<v
       const message = error instanceof Error ? error.message : String(error);
       await db
         .update(jobRuns)
-        .set({ status: "error", error: message, updatedAt: new Date() })
+        .set({ status: error instanceof AmbiguousEmailDeliveryError ? "delivery_unknown" : "error", deliveryOutcome: error instanceof AmbiguousEmailDeliveryError ? "ambiguous" : null, error: message, updatedAt: new Date() })
         .where(eq(jobRuns.id, jobRunId));
       await sendNotification(
         `❌ <b>Resumed Connectivity Job #${jobRunId} Failed</b>\n<code>${escapeTelegramHtml(message)}</code>`

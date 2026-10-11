@@ -8,9 +8,142 @@ import { runRosterJob } from "./jobs/roster-job";
 import { runConnectivityJob } from "./jobs/connectivity-job";
 import { initConfirmationHandlers, startPolling } from "./telegram";
 import { getScheduleWindow } from "./schedule-settings";
+import { db } from "@/db";
+import { jobRuns } from "@/db/schema";
+import { and, eq, isNull, lte, ne, or } from "drizzle-orm";
+import { resumeApprovedRosterJob } from "./jobs/roster-job";
+import { resumeApprovedConnectivityJob } from "./jobs/connectivity-job";
 import { APP_TIME_ZONE, getAppDateParts, getAppDateString, getAppMinuteOfDay } from "./app-time";
 
 const SCHEDULE_CRON = "* * * * *";
+
+async function recoverDueDeliveryRetries(): Promise<void> {
+  const now = new Date();
+  const dueFilter = and(
+    eq(jobRuns.status, "retrying"),
+    eq(jobRuns.workflowStep, "delivery"),
+    lte(jobRuns.nextAttemptAt, now),
+    or(isNull(jobRuns.leaseExpiresAt), lte(jobRuns.leaseExpiresAt, now))
+  );
+  const dueJobs = await db
+    .select({ id: jobRuns.id, jobType: jobRuns.jobType })
+    .from(jobRuns)
+    .where(dueFilter)
+    .limit(20);
+
+  for (const dueJob of dueJobs) {
+    const [claimed] = await db
+      .update(jobRuns)
+      .set({ status: "confirmed", leaseExpiresAt: null, updatedAt: now })
+      .where(and(eq(jobRuns.id, dueJob.id), dueFilter))
+      .returning({ id: jobRuns.id });
+    if (!claimed) continue;
+
+    const resume = dueJob.jobType === "roster"
+      ? resumeApprovedRosterJob
+      : dueJob.jobType === "connectivity"
+      ? resumeApprovedConnectivityJob
+      : undefined;
+    if (resume) {
+      void resume(dueJob.id).catch((error: unknown) =>
+        console.error(`[Scheduler] Could not resume due delivery retry for job #${dueJob.id}:`, error)
+      );
+    }
+  }
+}
+
+async function recoverDuePreparationRetries(): Promise<void> {
+  const now = new Date();
+  const dueFilter = and(
+    eq(jobRuns.status, "retrying"),
+    ne(jobRuns.workflowStep, "delivery"),
+    lte(jobRuns.nextAttemptAt, now),
+    or(isNull(jobRuns.leaseExpiresAt), lte(jobRuns.leaseExpiresAt, now))
+  );
+  const dueJobs = await db
+    .select({ id: jobRuns.id, jobType: jobRuns.jobType, triggerType: jobRuns.triggerType, scheduledDate: jobRuns.scheduledDate, workflowStep: jobRuns.workflowStep, telegramMessageId: jobRuns.telegramMessageId })
+    .from(jobRuns)
+    .where(dueFilter)
+    .limit(20);
+
+  for (const dueJob of dueJobs) {
+    if (dueJob.workflowStep === "approval" && dueJob.telegramMessageId) {
+      await db.update(jobRuns)
+        .set({ status: "waiting_confirm", nextAttemptAt: null, leaseExpiresAt: null, updatedAt: now })
+        .where(and(eq(jobRuns.id, dueJob.id), dueFilter));
+      continue;
+    }
+    const [claimed] = await db
+      .update(jobRuns)
+      .set({ status: "pending", nextAttemptAt: null, leaseExpiresAt: null, updatedAt: now })
+      .where(and(eq(jobRuns.id, dueJob.id), dueFilter))
+      .returning({ id: jobRuns.id });
+    if (!claimed) continue;
+
+    if (dueJob.jobType === "roster") {
+      void runRosterJob(dueJob.triggerType as "scheduled" | "manual", dueJob.scheduledDate ?? undefined, dueJob.id)
+        .catch((error: unknown) => console.error(`[Scheduler] Could not resume roster preparation #${dueJob.id}:`, error));
+    } else if (dueJob.jobType === "connectivity") {
+      void runConnectivityJob(dueJob.triggerType as "scheduled" | "manual", dueJob.scheduledDate ?? undefined, dueJob.id)
+        .catch((error: unknown) => console.error(`[Scheduler] Could not resume connectivity preparation #${dueJob.id}:`, error));
+    }
+  }
+}
+
+async function recoverExpiredApprovals(): Promise<void> {
+  const now = new Date();
+  const waitingStatus = or(eq(jobRuns.status, "waiting_confirm"), eq(jobRuns.status, "waiting_adjustment"));
+  const dueFilter = and(waitingStatus, lte(jobRuns.approvalExpiresAt, now));
+  const dueJobs = await db
+    .select({ id: jobRuns.id, jobType: jobRuns.jobType })
+    .from(jobRuns)
+    .where(dueFilter)
+    .limit(20);
+
+  for (const dueJob of dueJobs) {
+    const [approved] = await db
+      .update(jobRuns)
+      .set({ status: "confirmed", updatedAt: now })
+      .where(and(eq(jobRuns.id, dueJob.id), dueFilter))
+      .returning({ id: jobRuns.id });
+    if (!approved) continue;
+
+    const resume = dueJob.jobType === "roster"
+      ? resumeApprovedRosterJob
+      : dueJob.jobType === "connectivity"
+      ? resumeApprovedConnectivityJob
+      : undefined;
+    if (resume) {
+      void resume(dueJob.id).catch((error: unknown) =>
+        console.error(`[Scheduler] Could not process timed-out approval for job #${dueJob.id}:`, error)
+      );
+    }
+  }
+}
+
+async function markExpiredSendsUnknown(): Promise<void> {
+  const now = new Date();
+  const staleFilter = and(
+    eq(jobRuns.status, "sending"),
+    lte(jobRuns.leaseExpiresAt, now)
+  );
+  const staleJobs = await db
+    .update(jobRuns)
+    .set({
+      status: "delivery_unknown",
+      deliveryOutcome: "ambiguous",
+      error: "The app stopped or timed out while sending; SMTP acceptance could not be confirmed. Check the recipient mailbox before manually resending.",
+      updatedAt: now,
+    })
+    .where(staleFilter)
+    .returning({ id: jobRuns.id, jobType: jobRuns.jobType });
+
+  for (const staleJob of staleJobs) {
+    await import("./telegram").then(({ sendNotification }) =>
+      sendNotification(`⚠️ <b>Job #${staleJob.id} SMTP outcome unknown</b>. Check whether the email arrived before manually resending.`)
+    ).catch((error: unknown) => console.error(`[Scheduler] Could not report stale send #${staleJob.id}:`, error));
+  }
+}
 
 interface DailyRun {
   date: string;
@@ -168,6 +301,10 @@ export async function initScheduler() {
       const now = new Date();
       schedulerState.lastSchedulerCheckAt = now.toISOString();
       const window = await getScheduleWindow();
+      await recoverDueDeliveryRetries();
+      await recoverDuePreparationRetries();
+      await recoverExpiredApprovals();
+      await markExpiredSendsUnknown();
       const [startHour, startMinute] = window.start.split(":").map(Number);
       const [endHour, endMinute] = window.end.split(":").map(Number);
       const windowStart = startHour! * 60 + startMinute!;
@@ -182,7 +319,7 @@ export async function initScheduler() {
         window.days,
         () => {
           console.log("[Scheduler] Running roster job (scheduled)");
-          runRosterJob("scheduled").catch((e: unknown) =>
+          runRosterJob("scheduled", getAppDateString(now)).catch((e: unknown) =>
             console.error("[Scheduler] Roster job failed:", e)
           );
         }
@@ -196,7 +333,7 @@ export async function initScheduler() {
         window.days,
         () => {
           console.log("[Scheduler] Running connectivity job (scheduled)");
-          runConnectivityJob("scheduled").catch((e: unknown) =>
+          runConnectivityJob("scheduled", getAppDateString(now)).catch((e: unknown) =>
             console.error("[Scheduler] Connectivity job failed:", e)
           );
         }

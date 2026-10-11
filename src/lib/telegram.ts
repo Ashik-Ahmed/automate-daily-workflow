@@ -87,6 +87,27 @@ export function escapeTelegramHtml(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+async function removeConfirmationButtons(
+  bot: Bot,
+  chatId: string,
+  messageId: number,
+  jobRunId: number
+): Promise<void> {
+  try {
+    await bot.api.editMessageReplyMarkup({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] },
+    });
+  } catch (error: unknown) {
+    // A Telegram edit failure must not prevent the recorded decision from being processed.
+    console.error(
+      `[Telegram] Could not remove confirmation buttons for job #${jobRunId}:`,
+      error
+    );
+  }
+}
+
 /** Wire callback_query and message handlers (called once at app startup) */
 export function initConfirmationHandlers() {
   if (_handlersRegistered) return;
@@ -128,6 +149,15 @@ export function initConfirmationHandlers() {
     if (!nextStatus) {
       await bot.api.sendMessage({ chat_id: chatId, text: "Unknown confirmation action." });
       return;
+    }
+
+    if (query.message) {
+      await removeConfirmationButtons(
+        bot,
+        chatId,
+        query.message.message_id,
+        jobRunId
+      );
     }
 
     if (!activeJobRunners.has(jobRunId)) {
@@ -259,14 +289,12 @@ export function initConfirmationHandlers() {
           ? `✅ <b>Approved!</b> Email will be sent now. (Job #${jobRunId})`
           : `❌ <b>Cancelled.</b> Email was NOT sent. (Job #${jobRunId})`;
       const messageId = query.message!.message_id;
-      const replyMarkup = { inline_keyboard: [] };
       if (entry?.isPhoto || (query.message && "photo" in query.message)) {
         await bot.api.editMessageCaption({
           chat_id: chatId,
           message_id: messageId,
           caption: finalText,
           parse_mode: "HTML",
-          reply_markup: replyMarkup,
         });
       } else {
         await bot.api.editMessageText({
@@ -274,7 +302,6 @@ export function initConfirmationHandlers() {
           message_id: messageId,
           text: finalText,
           parse_mode: "HTML",
-          reply_markup: replyMarkup,
         });
       }
     } else {
